@@ -1,0 +1,18 @@
+[package]
+name = "phi-sleep-continue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "无人值守自动继续——phi 扩展（pi 版 sleep-continue 的 Rust 移植）"
+
+[[bin]]
+name = "phi-sleep-continue"
+path = "src/main.rs"
+
+[dependencies]
+phi-ext.workspace = true
+phi-ext-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

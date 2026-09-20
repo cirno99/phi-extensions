@@ -1,0 +1,19 @@
+[package]
+name = "phi-rtk-optimizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RTK 命令重写与工具输出压缩——phi 扩展（pi 版 pi-rtk-optimizer 的 Rust 移植）"
+
+[[bin]]
+name = "phi-rtk-optimizer"
+path = "src/main.rs"
+
+[dependencies]
+phi-ext.workspace = true
+phi-ext-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true

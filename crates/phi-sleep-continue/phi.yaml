@@ -1,0 +1,5 @@
+name: phi-sleep-continue
+version: "0.1.0"
+exec: ./phi-sleep-continue
+description: 无人值守自动继续 + 规则化自动审批
+enabled: true

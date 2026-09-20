@@ -1,0 +1,18 @@
+[package]
+name = "phi-asymptotic-thinking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "渐近式思考六态状态机——phi 扩展（pi 版 asymptotic-thinking 的 Rust 移植）"
+
+[[bin]]
+name = "phi-asymptotic-thinking"
+path = "src/main.rs"
+
+[dependencies]
+phi-ext.workspace = true
+phi-ext-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

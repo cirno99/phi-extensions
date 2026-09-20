@@ -1,0 +1,5 @@
+name: phi-asymptotic-thinking
+version: "0.1.0"
+exec: ./phi-asymptotic-thinking
+description: 渐近式思考六态状态机（工具 + 状态守卫 + 命令）
+enabled: true

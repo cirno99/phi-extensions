@@ -1,0 +1,5 @@
+name: phi-rtk-optimizer
+version: "0.1.0"
+exec: ./phi-rtk-optimizer
+description: RTK 命令重写与工具输出压缩
+enabled: true

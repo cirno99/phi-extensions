@@ -1,0 +1,5 @@
+name: phi-cache-optimizer
+version: "0.1.0"
+exec: ./phi-cache-optimizer
+description: 缓存优化配置与能力诊断
+enabled: true

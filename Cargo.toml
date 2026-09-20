@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/phi-ext-common",
+    "crates/phi-asymptotic-thinking",
+    "crates/phi-rtk-optimizer",
+    "crates/phi-sleep-continue",
+    "crates/phi-cache-optimizer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/pulseaiclub/phi"
+
+[workspace.dependencies]
+phi-ext = { git = "https://github.com/pulseaiclub/phi", branch = "main" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+# 正则：rtk 输出压缩与命令检测需要大量模式匹配，与 pi 版保持一致
+regex = "1"
+phi-ext-common = { path = "crates/phi-ext-common" }
+# 竞技场分配器：单次调用内的临时分配，调用结束整体释放
+bumpalo = { version = "3", features = ["collections"] }
+# SIMD JSON 解析：工具入参、配置与状态文件的热路径
+simd-json = "0.18"
+# 全局分配器：长驻扩展进程的分配热点优化
+tikv-jemallocator = "0.6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
