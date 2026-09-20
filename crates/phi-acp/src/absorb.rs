@@ -103,6 +103,63 @@ fn clamp_window(text: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
+/// 保留窗口的下限：再激进也不能把 stub 压到连错误行与结论都看不见。
+const MIN_KEEP_PREFIX_CHARS: usize = 400;
+const MIN_KEEP_SUFFIX_CHARS: usize = 150;
+/// 使用率到达该值时保留窗口缩到下限（同时也是「超限压力带」的开端）。
+const AGGRESSIVE_AT_USAGE: f64 = 0.95;
+
+/// 根据当前使用率解析本次吸收的保留窗口。
+///
+/// # 为什么是自适应的
+///
+/// 固定窗口会给出固定的水位：不管上下文是 60K 还是 170K，每次都只删同样多，
+/// 于是使用率高时吸不赢新增量，只能看着上下文慢慢堆积。
+///
+/// 这里把保留窗口做成使用率的函数：刚过门槛时几乎保持配置值（信息留得最全），
+/// 接近上限时缩到下限（回收量最大）。于是吸收量随压力单调递增，形成一个
+/// **自调节的负反馈**：使用率越高→删得越多→回落；回落低于门槛后又停止动手，
+/// 让上下文自然长回来。最终上下文在「门槛水位 ~ 上限」之间波动，而不是单边堆积。
+///
+/// 返回 `(保留前缀字符数, 保留后缀字符数)`。
+///
+/// 两端都是**硬插值**：t=0 时等于配置值，t=1 时落到 [`MIN_KEEP_PREFIX_CHARS`] /
+/// [`MIN_KEEP_SUFFIX_CHARS`]。配置值已经小于下限时以配置值为准（用户显式指定优先）。
+fn resolve_keep_window(usage: f64, config: &AbsorbConfig) -> (usize, usize) {
+    let floor_pct = config.context_threshold_pct.max(0.0);
+    // 从门槛到 AGGRESSIVE_AT_USAGE 之间线性加码；门槛缺失时按满压处理。
+    let span = (AGGRESSIVE_AT_USAGE - floor_pct).max(f64::EPSILON);
+    let t = ((usage - floor_pct) / span).clamp(0.0, 1.0);
+    let lerp = |configured: usize, floor: usize| -> usize {
+        if configured <= floor {
+            return configured;
+        }
+        let value = configured as f64 - (configured - floor) as f64 * t;
+        value.round() as usize
+    };
+    (
+        lerp(config.keep_prefix_chars, MIN_KEEP_PREFIX_CHARS),
+        lerp(config.keep_suffix_chars, MIN_KEEP_SUFFIX_CHARS),
+    )
+}
+
+/// 根据使用率解析本次吸收的最小 token 门槛。
+///
+/// 压力越大，越值得为「中等大小」的输出付一次重跑成本：门槛从配置值
+/// 降到下限 200 token。这样高水位时每个工具结果都能贡献一点回收量，
+/// 而不是只有巨型输出才被处理。
+fn resolve_min_tokens(usage: f64, config: &AbsorbConfig) -> u64 {
+    /// 高压下的最小门槛：再小的输出也不值得为它付重跑成本。
+    const MIN_TOKENS_FLOOR: u64 = 200;
+    let configured = config.min_tool_tokens.max(MIN_TOKENS_FLOOR);
+    let floor_pct = config.context_threshold_pct.max(0.0);
+    let span = (AGGRESSIVE_AT_USAGE - floor_pct).max(f64::EPSILON);
+    let t = ((usage - floor_pct) / span).clamp(0.0, 1.0);
+    // 从配置值线性降到下限（最多降 60%）。
+    let scaled = configured as f64 * (1.0 - 0.6 * t);
+    (scaled as u64).clamp(MIN_TOKENS_FLOOR, configured)
+}
+
 /// 规划一次吸收；`None` 表示这条结果保持原样。
 ///
 /// `context_usage` 传当前使用率（0 表示未知）；只有 `contextThresholdPct > 0`
@@ -128,13 +185,13 @@ pub fn plan_absorb(
     }
 
     let original_tokens = count_tokens(content);
-    if original_tokens < config.min_tool_tokens {
+    let min_tokens = resolve_min_tokens(context_usage, config);
+    if original_tokens < min_tokens {
         return None;
     }
 
+    let (keep_prefix, keep_suffix) = resolve_keep_window(context_usage, config);
     let total_chars = content.chars().count();
-    let keep_prefix = config.keep_prefix_chars;
-    let keep_suffix = config.keep_suffix_chars;
     // 中段必须有值得砍掉的东西，否则原样返回。
     if total_chars <= keep_prefix + keep_suffix {
         return None;
@@ -248,5 +305,65 @@ mod tests {
         };
         let mid = "x".repeat(9000);
         assert!(plan_absorb("bash", &mid, false, 0.0, &cfg).is_none());
+    }
+
+    /// 保留窗口随使用率单调收缩：这是「吸到高水位就多删」的调节回路。
+    #[test]
+    fn keep_window_should_shrink_as_usage_rises() {
+        let cfg = AbsorbConfig {
+            context_threshold_pct: 0.30,
+            keep_prefix_chars: 2000,
+            keep_suffix_chars: 800,
+            ..config()
+        };
+        let (p_low, s_low) = resolve_keep_window(0.30, &cfg);
+        let (p_mid, s_mid) = resolve_keep_window(0.60, &cfg);
+        let (p_high, s_high) = resolve_keep_window(0.95, &cfg);
+        assert!(p_low >= p_mid && p_mid >= p_high, "前缀窗口应递减");
+        assert!(s_low >= s_mid && s_mid >= s_high, "后缀窗口应递减");
+        // 刚过门槛时保持配置值。
+        assert_eq!((p_low, s_low), (2000, 800));
+        // 到达超限压力带时落到下限（信息最少但仍可见）。
+        assert_eq!(
+            (p_high, s_high),
+            (MIN_KEEP_PREFIX_CHARS, MIN_KEEP_SUFFIX_CHARS)
+        );
+    }
+
+    /// 高水位下「中等大小」的输出也应被吸收：否则新增量吸不赢，只能堆积。
+    #[test]
+    fn higher_usage_should_absorb_more_outputs() {
+        let cfg = AbsorbConfig {
+            context_threshold_pct: 0.30,
+            min_tool_tokens: 1000,
+            keep_prefix_chars: 2000,
+            keep_suffix_chars: 800,
+            ..config()
+        };
+        // ~800 token（3200 字符）的中等输出：门槛 1000 时不够格。
+        let mid = format!("HEAD{}TAIL", "x".repeat(3200));
+        assert!(plan_absorb("bash", &mid, false, 0.30, &cfg).is_none());
+        // 接近上限时门槛降到 400（降 60%），同一条输出被吸收。
+        assert!(plan_absorb("bash", &mid, false, 0.95, &cfg).is_some());
+    }
+
+    /// 回收量必须随压力单调递增（更高使用率 → 保留窗口更小 → 删得更多）。
+    #[test]
+    fn reclaimed_tokens_should_grow_with_usage() {
+        let cfg = AbsorbConfig {
+            context_threshold_pct: 0.30,
+            keep_prefix_chars: 2000,
+            keep_suffix_chars: 800,
+            ..config()
+        };
+        let big = format!("HEAD{}TAIL", "y".repeat(80_000));
+        let low = plan_absorb("bash", &big, false, 0.35, &cfg).expect("应吸收");
+        let high = plan_absorb("bash", &big, false, 0.95, &cfg).expect("应吸收");
+        assert!(
+            high.reclaimed_tokens() > low.reclaimed_tokens(),
+            "高压下应回收更多：low={} high={}",
+            low.reclaimed_tokens(),
+            high.reclaimed_tokens()
+        );
     }
 }

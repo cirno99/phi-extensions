@@ -201,7 +201,17 @@ pub fn decide_nudge(input: NudgeInput<'_>) -> NudgeDecision {
         && baseline == 0
         && usage >= config.nudge.min_context_limit_pct
         && max_pending >= nudge_growth_tokens;
-    let growth_ready = first_sight_mass_ready || growth_since_reference >= growth_floor;
+    // 增长驱动的提醒只在「压力带」里发。
+    //
+    // 这不是调参而是修正成本模型：phi 会把转向消息当成 user 消息永久 append
+    // （见 `main.rs`），且 `turn_stopping` 返回 `continue` 会**跳过**宿主的
+    // `runCompact`（`internal/agent/engine.go`：`continue` 后才轮到 compaction）。
+    // 而提醒想换来的 `compress` 块在 phi 上只写进扩展自己的 state.json，
+    // 压不掉宿主历史（见 `crate::absorb` 文档）。于是带外提醒是双重亏损：
+    // 永久 +token，且把唯一能真正重置上下文的宿主压缩拦住了。
+    // 带外的一切回收交给静默的 absorb，只在高水位才出声。
+    let growth_ready = usage >= config.nudge.max_context_limit_pct
+        && (first_sight_mass_ready || growth_since_reference >= growth_floor);
 
     let t2_count = tiers.get(&2).map(|(_, b)| b.len()).unwrap_or(0);
     let t3_count = tiers.get(&3).map(|(_, b)| b.len()).unwrap_or(0);
@@ -806,8 +816,13 @@ mod tests {
         assert!(tier_rules_body(3, &prompts, true).contains("ULTRA-CONDENSATION"));
     }
 
+    /// 回归：带外（低于压力带）的提醒必须被抑制。
+    ///
+    /// phi 把转向消息当 user 消息永久 append，且 `continue` 会跳过宿主
+    /// `runCompact`；而提醒换来的 `compress` 块在 phi 上压不掉宿主历史。
+    /// 所以「一过 min-context-pct 就发提醒」是纯亏损路径，必须只在高水位发。
     #[test]
-    fn tuned_profile_should_nudge_earlier_than_default() {
+    fn growth_nudge_should_be_suppressed_below_pressure_band() {
         let messages = vec![CoreMessage::text("a", Role::User, "hi")];
         let state = crate::state::create_initial_state();
         let rec = Recommendation {
@@ -816,34 +831,37 @@ mod tests {
                 end_ref: "m00004".into(),
                 count: 4,
                 tokens: 20_000,
+                chars: Some(80_000),
                 ..Default::default()
             }],
             ..Default::default()
         };
-        // 使用率 30%、可压缩 20k：内核默认（min 45% / 阈值 50k）不触发。
         let mut config = Config::default_for(200_000);
-        let default_decision = decide_nudge(NudgeInput {
-            token_count: 60_000,
-            config: &config,
-            state: &state,
-            messages: &messages,
-            recommendation: Some(&rec),
-        });
-        assert!(!default_decision.should_inject);
-        // 调优后的默认阈值（min 30% / 阈值 20k）则触发 T1。
         config.nudge.growth_floor = 20_000;
         config.nudge.growth_cap = 20_000;
         config.nudge.min_growth_floor = 10_000;
         config.nudge.min_context_limit_pct = 0.30;
-        config.nudge.max_context_limit_pct = 0.65;
-        let tuned_decision = decide_nudge(NudgeInput {
-            token_count: 60_000,
+        config.nudge.max_context_limit_pct = 0.90;
+
+        // 使用率 25%（50K）——低于压力带 90%：即使增长足够也不发。
+        let below = decide_nudge(NudgeInput {
+            token_count: 50_000,
             config: &config,
             state: &state,
             messages: &messages,
             recommendation: Some(&rec),
         });
-        assert!(tuned_decision.should_inject);
-        assert_eq!(tuned_decision.tier, Some(1));
+        assert!(!below.should_inject, "带外不应发增长驱动提醒");
+
+        // 使用率 95%（190K）——超过压力带：正常发 T1。
+        let above = decide_nudge(NudgeInput {
+            token_count: 190_000,
+            config: &config,
+            state: &state,
+            messages: &messages,
+            recommendation: Some(&rec),
+        });
+        assert!(above.should_inject, "超限带内应发提醒");
+        assert_eq!(above.tier, Some(1));
     }
 }

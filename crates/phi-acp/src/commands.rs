@@ -11,7 +11,7 @@ const USAGE: &str = "📋 /acp 子命令：\n\
   status                       — 上下文使用率、块统计与可压缩范围（默认）\n\
   compress                     — 立即压缩当前可压缩范围（交由模型调用 compress 工具）\n\
   enable | disable             — 开关扩展\n\
-  config <key> <value>         — 设置配置（context-limit / render-tags / min-compress / host-tokens / growth-tokens / min-growth-tokens / min-context-pct / max-context-pct / tier2-trigger / tier3-trigger / absorb / absorb-min-tokens / absorb-keep-prefix / absorb-keep-suffix / absorb-threshold-pct）\n\
+  config <key> <value>         — 设置配置（context-limit / render-tags / min-compress / host-tokens / growth-tokens / min-growth-tokens / min-context-pct / max-context-pct / tier2-trigger / tier3-trigger / absorb / absorb-min-tokens / absorb-keep-prefix / absorb-keep-suffix / absorb-threshold-pct / auto-nudge）\n\
   rules                        — 列出持久规则\n\
   reset                        — 清空当前会话观测视图与压缩状态（需确认）\n\
   help                         — 显示本说明";
@@ -39,9 +39,17 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                     let report = {
                         let mut guard = shared.borrow_mut();
                         let outcome = guard.process();
+                        let tokens = guard.effective_token_count();
+                        let source = if guard.config.use_host_tokens
+                            && crate::session_tokens::last_read_used_host()
+                        {
+                            "host"
+                        } else {
+                            "local estimate"
+                        };
                         let report = crate::compress::status(
                             &guard.state,
-                            guard.effective_token_count(),
+                            tokens,
                             &guard.config.to_kernel_config(),
                         );
                         let ranges = outcome
@@ -55,15 +63,21 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                             })
                             .unwrap_or_default();
                         let absorbed = guard.state.stats.absorbed_tokens;
-                        (report, ranges, absorbed)
+                        let gate = guard.config.absorb_context_threshold_pct;
+                        let auto_nudge = guard.config.auto_nudge_enabled;
+                        (report, ranges, absorbed, source, gate, auto_nudge)
                     };
                     ctx.notify(
                         "info",
                         &format!(
-                            "ACP: {:.1}% ({}/{} tokens) · active blocks {} · total {} · reclaimed {} tokens\n{}",
+                            "ACP: {:.1}% ({}/{} tokens, {}) · absorb 门槛 {:.0}% (已回收 {}) · 自动提醒 {} · active blocks {} · total {} · reclaimed {} tokens\n{}",
                             report.0.context_usage * 100.0,
                             report.0.token_count,
                             report.0.model_context_limit,
+                            report.3,
+                            report.4 * 100.0,
+                            report.2,
+                            if report.5 { "on" } else { "off" },
                             report.0.active_blocks,
                             report.0.total_blocks,
                             report.0.tokens_compressed,
@@ -183,6 +197,13 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                                 Ok(v) => guard.config.absorb_context_threshold_pct = v,
                                 Err(_) => {
                                     ctx.notify("error", "absorb-threshold-pct 需要小数（如 0.5）");
+                                    return Ok(());
+                                }
+                            },
+                            "auto-nudge" => match value.parse::<bool>() {
+                                Ok(v) => guard.config.auto_nudge_enabled = v,
+                                Err(_) => {
+                                    ctx.notify("error", "auto-nudge 需要 true/false");
                                     return Ok(());
                                 }
                             },

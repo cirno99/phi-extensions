@@ -50,6 +50,20 @@ pub fn reset_cache() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
 }
 
+// 最近一次读取是否真的拿到了宿主 usage。
+//
+// 用于 `/acp status` 如实告知「这个百分比是宿主真值还是本地估算」——两者
+// 相差可达 40%（本扩展只观测用户输入 + 工具结果 + 工具入参，看不到助手正文
+// 与推理），排障时必须能区分。
+thread_local! {
+    static HOST_TOKENS_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 最近一次 [`read_context_tokens`] 是否命中宿主 usage。
+pub fn last_read_used_host() -> bool {
+    HOST_TOKENS_OK.with(|c| c.get())
+}
+
 /// 读取当前活动会话的真实上下文 token 数（无可用数据时返回 `None`）。
 ///
 /// 会话文件只追加，因此只读取自上次调用以来新增的字节，把每 turn 的读盘量从
@@ -66,11 +80,11 @@ pub fn read_context_tokens() -> Option<u64> {
             .map(|entry| (entry.offset, entry.tokens))
     });
 
-    match cached {
+    let result = match cached {
         Some((offset, previous)) => {
             if offset == len {
                 // 文件没有新增内容，直接复用上次结果。
-                return previous;
+                return finish(previous);
             }
             let (appended, new_offset) = read_appended(&file, offset);
             let tokens = appended.or(previous);
@@ -94,16 +108,37 @@ pub fn read_context_tokens() -> Option<u64> {
             });
             tokens
         }
-    }
+    };
+    finish(result)
+}
+
+/// 记录「本次是否命中宿主 usage」并原样返回结果。
+fn finish(tokens: Option<u64>) -> Option<u64> {
+    HOST_TOKENS_OK.with(|c| c.set(tokens.is_some()));
+    tokens
 }
 
 /// 定位当前活动会话文件。
 ///
-/// 优先用宿主推送的 cwd（`phi` 会话目录按 cwd 分目录），其次回退进程 `PWD`。
+/// 候选 cwd 依可信度排序：
+/// 1. 宿主经命令上下文回填的 cwd（`/acp` 执行过才有）；
+/// 2. **父进程 cwd**——宿主用 `cmd.Dir = <扩展目录>` 启动扩展，但父进程自身
+///    的 cwd 就是用户的项目目录，直接读 `/proc/<ppid>/cwd` 即可，无需等
+///    `/acp` 跑过一次。这是让 `useHostTokens` 从第一轮就生效的关键：扩展
+///    进程的 `PWD` 是自己的目录，仅靠它定位会一直找不到正确的会话目录，
+///    于是全程退回本地估算（实测高估/低估可达 40%）。
+/// 3. 进程 `PWD`（最后的兜底）。
+///
 /// **不做**「全局最新 `.jsonl`」回退：多项目并行时会读到别的项目的会话，
 /// 把别人的 usage 当成本会话的上下文，使用率判断随之错位。宁可不给数。
 fn active_session_file() -> Option<PathBuf> {
-    for cwd in [host_cwd(), std::env::var("PWD").ok().unwrap_or_default()] {
+    let mut candidates: Vec<String> = vec![host_cwd()];
+    if let Some(cwd) = parent_process_cwd() {
+        candidates.push(cwd);
+    }
+    candidates.push(std::env::var("PWD").ok().unwrap_or_default());
+
+    for cwd in candidates {
         if cwd.trim().is_empty() {
             continue;
         }
@@ -113,6 +148,23 @@ fn active_session_file() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 宿主（父进程）的工作目录。
+///
+/// Linux 上 `/proc/<ppid>/cwd` 指向真实项目目录；宿主刻意没给子进程设置
+/// `PWD`（其源码中没有 `PWD` 字面量），所以这是扩展在 `/acp` 之前拿到项目
+/// 目录的唯一途径。非 Linux 或读取失败时返回 `None`（回退到其它候选）。
+fn parent_process_cwd() -> Option<String> {
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    // 格式：`pid (comm) state ppid ...`；`comm` 可能含空格 / 括号，因此必须从
+    // **最后一个** `)` 之后开始切分才可靠。
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    let ppid = fields.next()?;
+    let cwd = fs::read_link(format!("/proc/{ppid}/cwd")).ok()?;
+    Some(cwd.to_string_lossy().into_owned())
 }
 
 // 宿主报告的工作目录。

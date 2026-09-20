@@ -41,6 +41,14 @@ pub struct Runtime {
     /// 契约会被拼进用户消息并永久留在会话历史里，因此**每会话只需一次**；
     /// 每轮重复注入就是持续推大上下文。
     contract_injected: bool,
+    /// 是否允许把状态写回磁盘。
+    ///
+    /// 单测里必须关掉：`Runtime::new()` 读的是用户**真实**的 config/state 路径，
+    /// 测试一旦触发 `persist()` 就会把真实 `state.json` 覆盖成空状态
+    /// （实测：跑一次 `cargo test -p phi-acp` 就把用户的块全部抹掉）。
+    persist_enabled: bool,
+    /// 自上次落盘以来状态是否变化（避免每 turn 无谓写盘）。
+    dirty: bool,
 }
 
 impl Runtime {
@@ -58,7 +66,21 @@ impl Runtime {
             pending_notices: Vec::new(),
             scratch: Scratch::with_capacity(16 * 1024),
             contract_injected: false,
+            persist_enabled: true,
+            dirty: false,
         }
+    }
+
+    /// 创建一个**不落盘**的运行时（单测专用）。
+    ///
+    /// 单测必须用它：`Runtime::new()` 指向用户真实的 state.json，测试里任何
+    /// `persist()` 都会把用户的压缩块抹掉。这个方法读到的状态依然是真实的，
+    /// 只是永不写回。
+    #[cfg(test)]
+    pub fn new_isolated() -> Self {
+        let mut runtime = Self::new();
+        runtime.persist_enabled = false;
+        runtime
     }
 
     /// 内核配置（每次由扩展配置派生）。
@@ -140,13 +162,23 @@ impl Runtime {
         // absorb：把巨型输出换成「头 + 尾 + 标记」。命中时同时更新观测视图，
         // 否则 `estimate_tokens` 会系统性高估上下文（视图留着全量文本，
         // 而上游只收到 stub）。
-        let usage = self.current_usage();
+        // 使用率未知（−1）时按「刚过门槛」处理：既不因为拿不到数就彻底放弃
+        // 回收（那会让上下文无上限堆积），也不因为误判而一次性拉到最激进窗口。
+        let raw_usage = self.current_usage();
+        let usage = if raw_usage < 0.0 {
+            self.config.absorb_context_threshold_pct.max(0.0)
+        } else {
+            raw_usage
+        };
         let config = self.config.to_kernel_config().absorb.unwrap_or_default();
         let plan = absorb::plan_absorb(tool_name, &cleaned, is_error, usage, &config);
 
         let (text, replacement) = match plan {
             Some(plan) => {
                 self.state.stats.absorbed_tokens += plan.reclaimed_tokens();
+                // 只标脏、不立即写盘：工具结果是每 turn 最热的回调，逐个原子写
+                // 会把磁盘打满。真正的落盘交给 `persist_if_dirty`（turn_stopping）。
+                self.dirty = true;
                 let replacement = plan.text.clone();
                 (plan.text, Some(replacement))
             }
@@ -195,13 +227,20 @@ impl Runtime {
         self.estimate_tokens()
     }
 
-    /// 当前上下文使用率（未知时 0）。
+    /// 当前上下文使用率；**未知时返回负数**。
     ///
-    /// absorb 的使用率门槛用它。为了避免每 turn 重复读会话文件，只在启用门槛
-    /// （`absorbContextThresholdPct > 0`）时才真的去取数。
+    /// absorb 的门槛与自适应强度都用它。区分「未知」与「真的空」很关键：
+    /// 拿不到宿主真值且本地视图为空时（如会话刚开、或本地模型不上报 usage），
+    /// 使用率是未知而非 0——把它当成 0 会让门槛永远拦住一切，absorb 完全失效。
+    ///
+    /// 为避免每 turn 重复读会话文件，`read_context_tokens` 自带增量缓存（只读
+    /// 本 turn 新增的字节），所以这里可以放心调用。
     fn current_usage(&self) -> f64 {
-        if self.config.model_context_limit == 0 || self.config.absorb_context_threshold_pct <= 0.0 {
-            return 0.0;
+        if self.config.model_context_limit == 0 {
+            return -1.0;
+        }
+        if self.messages.is_empty() && crate::session_tokens::read_context_tokens().is_none() {
+            return -1.0;
         }
         self.effective_token_count() as f64 / self.config.model_context_limit as f64
     }
@@ -268,8 +307,30 @@ impl Runtime {
     }
 
     /// 持久化状态（原子写）。
+    ///
+    /// 单测创建的运行时（[`Self::new_isolated`]）会静默跳过，避免污染用户的
+    /// 真实 `state.json`。
     pub fn persist(&self) {
+        if !self.persist_enabled {
+            return;
+        }
         let _ = cfg::save_atomic(&config::state_path(), &self.state);
+    }
+
+    /// 标记状态已变化，等待下次 [`Self::persist`] 落盘。
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// 若状态有变化则落盘，并清掉脏标记。
+    ///
+    /// 用在每 turn 都会经过的钩子里：absorb 统计这类「慢慢累加」的字段
+    /// 需要定期落盘，但不能每 turn 无条件写盘。
+    pub fn persist_if_dirty(&mut self) {
+        if self.dirty {
+            self.persist();
+            self.dirty = false;
+        }
     }
 
     /// 保存配置。
@@ -309,9 +370,20 @@ fn load_state() -> CompressionState {
 mod tests {
     use super::*;
 
+    /// absorb 测试必须固定使用率门槛与 token 来源，否则 `absorbContextThresholdPct`
+    /// 默认值（0.30）会让小视界被门槛拦住、`useHostTokens` 会去读真实会话文件。
+    fn absorb_runtime() -> Runtime {
+        let mut runtime = Runtime::new_isolated();
+        runtime.reset_session();
+        runtime.config.absorb_enabled = true;
+        runtime.config.absorb_context_threshold_pct = 0.0;
+        runtime.config.use_host_tokens = false;
+        runtime
+    }
+
     #[test]
     fn record_should_grow_message_view() {
-        let mut runtime = Runtime::new();
+        let mut runtime = Runtime::new_isolated();
         runtime.reset_session();
         runtime.record_user_input("hello");
         runtime.record_tool_call("c1", "read", "{\"path\":\"x\"}");
@@ -323,7 +395,7 @@ mod tests {
     /// 回归：契约会永久留在会话历史里，每会话只能注入一次。
     #[test]
     fn contract_should_be_injected_once_per_session() {
-        let mut runtime = Runtime::new();
+        let mut runtime = Runtime::new_isolated();
         runtime.reset_session();
         let first = runtime.take_contract_injection("CONTRACT");
         assert_eq!(first, "CONTRACT");
@@ -335,7 +407,7 @@ mod tests {
 
     #[test]
     fn record_tool_result_should_strip_ansi() {
-        let mut runtime = Runtime::new();
+        let mut runtime = Runtime::new_isolated();
         runtime.reset_session();
         runtime.record_tool_result("c1", "bash", "\u{1b}[31merror\u{1b}[0m: boom", false);
         assert_eq!(runtime.messages[0].text_str(), "error: boom");
@@ -343,9 +415,7 @@ mod tests {
 
     #[test]
     fn absorb_should_shrink_large_tool_result_and_return_replacement() {
-        let mut runtime = Runtime::new();
-        runtime.reset_session();
-        runtime.config.absorb_enabled = true;
+        let mut runtime = absorb_runtime();
         runtime.config.absorb_min_tool_tokens = 100;
         let big = format!("HEAD{}TAIL", "x".repeat(40_000));
         let replacement = runtime.record_tool_result("c1", "bash", &big, false);
@@ -358,9 +428,7 @@ mod tests {
 
     #[test]
     fn absorb_should_leave_small_and_error_results_alone() {
-        let mut runtime = Runtime::new();
-        runtime.reset_session();
-        runtime.config.absorb_enabled = true;
+        let mut runtime = absorb_runtime();
         runtime.config.absorb_min_tool_tokens = 100;
         assert!(runtime
             .record_tool_result("c1", "read", "tiny", false)
@@ -374,9 +442,23 @@ mod tests {
         assert!(first.is_some());
     }
 
+    /// 使用率低于门槛时不动手：这是「上下文先自然长大再回收」的波动前提。
+    #[test]
+    fn absorb_should_respect_context_threshold() {
+        let mut runtime = absorb_runtime();
+        runtime.config.absorb_min_tool_tokens = 100;
+        runtime.config.absorb_context_threshold_pct = 0.5;
+        runtime.config.model_context_limit = 1_000_000;
+        let big = "x".repeat(40_000);
+        // 观测视图很小 ⇒ 使用率远低于 50% ⇒ 不吸收。
+        assert!(runtime
+            .record_tool_result("c1", "bash", &big, false)
+            .is_none());
+    }
+
     #[test]
     fn nudge_counter_should_cap() {
-        let mut runtime = Runtime::new();
+        let mut runtime = Runtime::new_isolated();
         runtime.reset_session();
         runtime.config.max_consecutive_nudges = 2;
         assert!(runtime.note_nudge());
@@ -384,5 +466,49 @@ mod tests {
         assert!(!runtime.note_nudge());
         runtime.reset_nudges();
         assert!(runtime.note_nudge());
+    }
+
+    /// 回归：单测绝不能写用户的真实 state.json。
+    ///
+    /// 历史事故：`Runtime::new()` 指向 `<phi_home>/extensions/phi-acp/state/
+    /// state.json`（用户真实文件），测试里的 `reset_session()` / `apply()`
+    /// 会调 `persist()`，于是跑一次 `cargo test` 就把用户的压缩块全部抹平。
+    /// 这里用一份哨兵状态验证隔离运行时不会落地。
+    #[test]
+    fn isolated_runtime_should_never_touch_user_state_file() {
+        let path = crate::config::state_path();
+        // 记下用户文件的现状（可能不存在）。
+        let before = std::fs::read(&path).ok();
+
+        let mut runtime = Runtime::new_isolated();
+        runtime.reset_session();
+        runtime.mark_dirty();
+        runtime.persist_if_dirty();
+        runtime.persist();
+
+        let after = std::fs::read(&path).ok();
+        assert_eq!(before, after, "隔离运行时不得改写用户 state.json");
+    }
+
+    /// absorb 命中只标脏；落盘由 `persist_if_dirty` 完成。
+    #[test]
+    fn absorb_should_mark_state_dirty() {
+        let mut runtime = Runtime::new_isolated();
+        runtime.config.absorb_enabled = true;
+        runtime.config.absorb_context_threshold_pct = 0.0;
+        runtime.config.use_host_tokens = false;
+        runtime.config.absorb_min_tool_tokens = 100;
+        runtime.reset_session();
+
+        assert!(!runtime.dirty, "初始不应是脏的");
+        let big = "x".repeat(40_000);
+        assert!(runtime
+            .record_tool_result("c1", "bash", &big, false)
+            .is_some());
+        assert!(runtime.dirty, "absorb 命中后应标脏");
+        assert!(runtime.state.stats.absorbed_tokens > 0);
+
+        runtime.persist_if_dirty();
+        assert!(!runtime.dirty, "落盘后脏标记应清除");
     }
 }

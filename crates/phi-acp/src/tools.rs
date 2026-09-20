@@ -242,13 +242,20 @@ fn register_status(ext: &mut phi::Extension, shared: Shared) {
         move |_args| {
             let mut guard = shared.borrow_mut();
             let outcome = guard.process();
-            let report = crate::compress::status(
-                &guard.state,
-                guard.effective_token_count(),
-                &guard.config.to_kernel_config(),
-            );
+            let tokens = guard.effective_token_count();
+            // 这个数字要么来自宿主会话文件（真值），要么是本地估算（只数
+            // 用户输入 + 工具结果 + 工具入参，看不到助手正文与推理）。
+            // 两者可差 40%，不标出来就会把「估算误差」当成「压缩失败」排查。
+            let source =
+                if guard.config.use_host_tokens && crate::session_tokens::last_read_used_host() {
+                    "host"
+                } else {
+                    "local estimate"
+                };
+            let report =
+                crate::compress::status(&guard.state, tokens, &guard.config.to_kernel_config());
             let mut lines = vec![format!(
-                "context: {:.1}% ({}/{} tokens) · active blocks {} · total {} · reclaimed {} tokens · absorbed {} tokens",
+                "context: {:.1}% ({}/{} tokens, {source}) · active blocks {} · total {} · reclaimed {} tokens · absorbed {} tokens",
                 report.context_usage * 100.0,
                 report.token_count,
                 report.model_context_limit,

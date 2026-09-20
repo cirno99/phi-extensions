@@ -130,7 +130,18 @@ fn register_before_agent_start(ext: &mut phi::Extension, shared: Rc<std::cell::R
     });
 }
 
-/// `turn_stopping`：增长驱动的提醒。
+/// `turn_stopping`：高水位提醒（仅在 `autoNudgeEnabled` 打开时）。
+///
+/// # 为什么默认不发
+///
+/// 这条钩子返回 `continue_` 会做两件在 phi 上都是净亏的事：把转向消息当作
+/// user 消息永久 append 进历史，并**跳过**同轮的宿主 `runCompact`
+/// （`internal/agent/engine.go`：`continue` 之后才轮到 compaction）——
+/// 而提醒想换来的 `compress` 块在 phi 上压不掉任何宿主历史（见 `crate::absorb`）。
+/// 因此默认关闭；真正能删 token 的是静默的 absorb。
+///
+/// 即使不发提醒，仍然跑一次 `process()`：推荐/块同步等状态需要在每轮结束
+/// 时更新（`/acp status` 与 `compress` 工具都读它）。
 fn register_turn_stopping(ext: &mut phi::Extension, shared: Rc<std::cell::RefCell<Runtime>>) {
     ext.on_turn_stopping(move |_ev| {
         let (should, text) = {
@@ -138,7 +149,16 @@ fn register_turn_stopping(ext: &mut phi::Extension, shared: Rc<std::cell::RefCel
             if !guard.config.enabled {
                 return None;
             }
+            let auto = guard.config.auto_nudge_enabled;
             let outcome = guard.process();
+            // absorb 统计只在内存里累加（见 `record_tool_result`），这里统一落盘。
+            // 放在 `return None` 之前：即使不发提醒，本 turn 的回收量也要持久化，
+            // 否则重启后 `/acp status` 的 absorbed 会归零。
+            guard.persist_if_dirty();
+            if !auto {
+                // 仍要推进状态，但不转向（不阻断宿主压缩、不写永久历史）。
+                return None;
+            }
             let nudge = outcome.nudge.as_ref()?;
             if !nudge.should_inject {
                 return None;
