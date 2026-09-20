@@ -81,6 +81,17 @@ pub fn lines<'a>(arena: &'a Bump, input: &'a str) -> ArenaVec<'a, &'a str> {
     out
 }
 
+/// 在竞技场内按 `\n` 切分，语义与 `str::split('\n')` 完全一致
+/// （保留末尾空行，且不处理 `\r`）。
+///
+/// 与 [`lines`] 的区别：`lines` 走 `str::lines`（丢弃末尾空行、去掉 `\r`），
+/// 适合「按行处理」；本函数适合需要与既有 `split('\n')` 行为逐字对齐的迁移。
+pub fn split_lines<'a>(arena: &'a Bump, input: &'a str) -> ArenaVec<'a, &'a str> {
+    let mut out = ArenaVec::with_capacity_in(estimate_lines(input), arena);
+    out.extend(input.split('\n'));
+    out
+}
+
 /// 在竞技场内剥离 ANSI 转义序列。
 pub fn strip_ansi<'a>(arena: &'a Bump, input: &'a str) -> ArenaString<'a> {
     let mut out = ArenaString::with_capacity_in(input.len(), arena);
@@ -130,6 +141,13 @@ mod tests {
         assert!(scratch.reserved_bytes() <= after_first);
         scratch.finish();
         assert_eq!(scratch.resets(), 2);
+    }
+
+    #[test]
+    fn split_lines_keeps_trailing_empty_like_str_split() {
+        let scratch = Scratch::with_capacity(64);
+        assert_eq!(split_lines(scratch.arena(), "a\nb\n").as_slice(), &["a", "b", ""]);
+        assert_eq!(split_lines(scratch.arena(), "").as_slice(), &[""]);
     }
 
     #[test]

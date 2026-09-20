@@ -17,13 +17,8 @@ use crate::types::SessionState;
 /// 扩展名（同时作为 `~/.phi/extensions/<name>/` 的目录名）。
 pub const EXTENSION_NAME: &str = "phi-asymptotic-thinking";
 
-/// 返回当前 Unix 毫秒时间戳（获取失败时退化为 0）。
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+/// 返回当前 Unix 毫秒时间戳（复用共享实现）。
+pub use phi_ext_common::time::now_ms;
 
 /// 状态与开关的持久化句柄。
 pub struct Store {

@@ -27,7 +27,11 @@ mod commands;
 mod config;
 mod state;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use phi_ext::{phi, pxb};
+use phi_ext_common::arena::Scratch;
 use serde_json::Value;
 
 use state::{is_retryable, question_block_reason, summarize_recommended_choices, Shared};
@@ -40,9 +44,12 @@ const REASON_SNIPPET_CHARS: usize = 300;
 fn main() -> Result<(), phi::Error> {
     let mut ext = phi::Extension::new("phi-sleep-continue", env!("CARGO_PKG_VERSION"));
     let shared = state::shared();
+    // 审批判定在每次工具调用上执行：竞技场单独放在一个共享单元里，
+    // 与 `SleepState` 分开借用以避免 `Bump` 卷入状态类型的派生约束。
+    let scratch = Rc::new(RefCell::new(Scratch::with_capacity(4 * 1024)));
 
     commands::register(&mut ext, shared.clone());
-    register_tool_call(&mut ext, shared.clone());
+    register_tool_call(&mut ext, shared.clone(), scratch);
     register_tool_result(&mut ext, shared.clone());
     register_turn_stopping(&mut ext, shared.clone());
     register_user_input(&mut ext, shared.clone());
@@ -61,7 +68,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
 
 /// 核心 1：拦截提问类工具，按「每题首选项 = 推荐项」自动作答；
 /// 随后对普通工具调用施加规则化自动审批。
-fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
+fn register_tool_call(ext: &mut phi::Extension, shared: Shared, scratch: Rc<RefCell<Scratch>>) {
     let question_tools = state::question_tool_names();
     ext.on_tool_call(move |ev| {
         let mut guard = shared.borrow_mut();
@@ -92,8 +99,21 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (route, decision, subject) =
-            approval::evaluate(&ev.tool_name, &input, &cwd, &guard.approval, &guard.approval_store);
+
+        let (route, decision, subject) = {
+            let mut arena = scratch.borrow_mut();
+            let result = approval::evaluate(
+                arena.arena(),
+                &ev.tool_name,
+                &input,
+                &cwd,
+                &guard.approval,
+                &guard.approval_store,
+            );
+            // 判定结果全部为拥有所有权的值，临时内存可立即整体释放。
+            arena.finish();
+            result
+        };
         guard.last_route = Some(route);
 
         match decision {
@@ -104,7 +124,7 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
             }
             approval::Decision::Deny(mut reason) => {
                 let denials = guard.approval_store.record_denial();
-                guard.last_denied = Some(subject);
+                guard.last_denied = subject;
                 if denials >= guard.approval.max_consecutive_denials {
                     reason.push_str(&format!(
                         "\n已连续被自动审批拒绝 {denials} 次，请停止动作，向用户说明情况并等待人工处理。"

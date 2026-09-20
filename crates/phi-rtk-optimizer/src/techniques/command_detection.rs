@@ -54,10 +54,14 @@ pub fn normalize_command_for_detection(command: Option<&str>) -> Option<String> 
     }
 }
 
-/// 命令是否命中任一模式。
-pub fn matches_command_patterns(command: Option<&str>, patterns: &[Regex]) -> bool {
-    match normalize_command_for_detection(command) {
-        Some(normalized) => patterns.iter().any(|pattern| pattern.is_match(&normalized)),
+/// 对**已归一化**的命令做模式匹配。
+///
+/// 一次压缩流程会依次尝试 build / test / git / linter 四类技术；若每类都重新
+/// 归一化，同一条命令会被解析 6 次。调用方应先
+/// [`normalize_command_for_detection`] 一次，再复用结果。
+pub fn matches_normalized_patterns(normalized: Option<&str>, patterns: &[Regex]) -> bool {
+    match normalized {
+        Some(normalized) => patterns.iter().any(|pattern| pattern.is_match(normalized)),
         None => false,
     }
 }
@@ -115,13 +119,14 @@ mod tests {
     }
 
     #[test]
-    fn matches_should_apply_patterns_to_normalized_command() {
+    fn matches_normalized_patterns_should_apply_to_normalized_command() {
         static CARGO_BUILD: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"^cargo\s+(build|check)\b").unwrap());
         let patterns = [CARGO_BUILD.clone()];
-        assert!(matches_command_patterns(Some("cargo build -q"), &patterns));
-        assert!(matches_command_patterns(Some("cargo check"), &patterns));
-        assert!(!matches_command_patterns(Some("cargo test"), &patterns));
-        assert!(!matches_command_patterns(None, &patterns));
+        let normalize = |raw: &str| normalize_command_for_detection(Some(raw));
+        assert!(matches_normalized_patterns(normalize("cargo build -q").as_deref(), &patterns));
+        assert!(matches_normalized_patterns(normalize("cargo check").as_deref(), &patterns));
+        assert!(!matches_normalized_patterns(normalize("cargo test").as_deref(), &patterns));
+        assert!(!matches_normalized_patterns(None, &patterns));
     }
 }

@@ -7,6 +7,8 @@
 
 use std::collections::BTreeMap;
 
+use phi_ext_common::time::now_ms;
+
 /// 一条压缩记录。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputMetricRecord {
@@ -49,10 +51,7 @@ impl OutputMetrics {
         };
 
         let record = OutputMetricRecord {
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            timestamp_ms: now_ms(),
             tool: tool.to_string(),
             techniques: if techniques.is_empty() {
                 "none".to_string()

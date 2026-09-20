@@ -189,6 +189,7 @@ dependencies = [
 name = "phi-rtk-optimizer"
 version = "0.1.0"
 dependencies = [
+ "bumpalo",
  "phi-ext",
  "phi-ext-common",
  "regex",
@@ -201,6 +202,7 @@ dependencies = [
 name = "phi-sleep-continue"
 version = "0.1.0"
 dependencies = [
+ "bumpalo",
  "phi-ext",
  "phi-ext-common",
  "serde",

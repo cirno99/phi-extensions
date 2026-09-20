@@ -121,6 +121,16 @@ pub fn has_ansi(input: &str) -> bool {
     input.as_bytes().contains(&0x1B)
 }
 
+/// [`strip_ansi`] 的快速版本：不含 `ESC` 时直接返回原串的拷贝。
+///
+/// 需要「无变化时零分配」的场景请直接用 [`has_ansi`] 做前置判断。
+pub fn strip_ansi_fast(input: &str) -> String {
+    if !has_ansi(input) {
+        return input.to_string();
+    }
+    strip_ansi(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +174,20 @@ mod tests {
     #[test]
     fn strip_ansi_should_drop_unterminated_escape_at_end() {
         assert_eq!(strip_ansi("text\u{1b}[3"), "text");
+    }
+
+    #[test]
+    fn strip_ansi_should_remove_csi_with_private_parameters() {
+        // `ESC[?25l`（隐藏光标）的参数以 `?` 开头：正则式实现常在此漏剥。
+        assert_eq!(strip_ansi("\u{1b}[?25lhidden\u{1b}[?25h"), "hidden");
+        assert_eq!(strip_ansi("\u{1b}[2Jcleared"), "cleared");
+        assert_eq!(strip_ansi("\u{1b}[1;2Hmoved"), "moved");
+    }
+
+    #[test]
+    fn strip_ansi_fast_should_avoid_rebuilding_clean_text() {
+        assert_eq!(strip_ansi_fast("plain"), "plain");
+        assert_eq!(strip_ansi_fast("\u{1b}[31mred\u{1b}[0m"), "red");
     }
 
     #[test]

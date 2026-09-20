@@ -8,8 +8,12 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use phi_ext_common::arena::Scratch;
+use phi_ext_common::time::now_ms;
+
+use crate::compactor::{self, CompactionOutcome};
 use crate::config::{self, RtkIntegrationConfig};
 use crate::metrics::OutputMetrics;
 use crate::rewriter::{resolve_rtk_executable, run_with_timeout, RtkExecutableResolution};
@@ -90,6 +94,8 @@ pub struct Runtime {
     pending_notices: Vec<String>,
     /// 进行中的 bash 命令（toolCallId → command），用于 tool_result 阶段判定命令类型。
     active_bash_commands: HashMap<String, String>,
+    /// 复用的竞技场：单次输出压缩的临时内存，调用结束整体释放。
+    scratch: Scratch,
     /// 缺 rtk 告警是否已发过。
     missing_rtk_warning_shown: bool,
 }
@@ -109,16 +115,38 @@ impl Runtime {
             suggestions: BoundedNoticeTracker::new(200),
             pending_notices: Vec::new(),
             active_bash_commands: HashMap::new(),
+            scratch: Scratch::with_capacity(16 * 1024),
             missing_rtk_warning_shown: false,
         }
     }
 
-    /// 当前时间（Unix 毫秒）。
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+    /// 压缩一次工具结果。
+    ///
+    /// 竞技场与配置/统计同属 `Runtime`：用字段级解构避免每轮
+    /// `config.clone()`（配置里有多个 `Vec<String>`），也不与 `RefCell` 打架。
+    pub fn compact(
+        &mut self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        content: &str,
+    ) -> CompactionOutcome {
+        let Runtime {
+            config,
+            metrics,
+            scratch,
+            ..
+        } = self;
+        let outcome = compactor::compact_tool_result(
+            scratch.arena(),
+            tool_name,
+            input,
+            content,
+            config,
+            Some(metrics),
+        );
+        // 临时内存整体释放，底层 chunk 保留给下一次调用复用。
+        scratch.finish();
+        outcome
     }
 
     /// 重新读取配置（配置不存在时先写出默认值）。
@@ -141,7 +169,7 @@ impl Runtime {
     /// 探测 rtk 是否可用。
     pub fn refresh_status(&mut self) {
         let resolution = resolve_rtk_executable(std::env::consts::OS, 1_000);
-        let checked_at = Self::now_ms();
+        let checked_at = now_ms();
         match run_with_timeout(&resolution.command, &["--version"], 5_000) {
             Ok(output) if output.code == 0 => {
                 self.status = RuntimeStatus {
@@ -182,7 +210,7 @@ impl Runtime {
         if !self.config.guard_when_rtk_missing {
             return;
         }
-        let now = Self::now_ms();
+        let now = now_ms();
         let stale = match self.status.last_checked_at {
             Some(checked) => now.saturating_sub(checked) > STATUS_STALE_AFTER.as_millis() as u64,
             None => true,

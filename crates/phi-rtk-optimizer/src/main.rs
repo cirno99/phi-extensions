@@ -201,15 +201,7 @@ fn register_tool_result(ext: &mut phi::Extension, shared: Shared) {
             }
         }
 
-        // 先克隆配置，避免同时可变/不可变借用 `Runtime`。
-        let config = guard.config.clone();
-        let outcome = compactor::compact_tool_result(
-            &ev.tool_name,
-            &input,
-            &ev.content,
-            &config,
-            Some(&mut guard.metrics),
-        );
+        let outcome = guard.compact(&ev.tool_name, &input, &ev.content);
 
         if !outcome.changed {
             return None;

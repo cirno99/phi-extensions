@@ -2,16 +2,23 @@
 //
 // 由 pi 版 pi-rtk-optimizer 的 src/techniques/test-output.ts 移植。
 //
-// 与 pi 版的差异（有意修正）：
-// pi 版第一条「test result:」模式把 `(\w+)` 当作 passed 分组，导致
-// `test result: ok. 5 passed; 0 failed;` 被解析成 passed=0 / failed=5。
-// 本实现按模式分别声明分组下标，取正确的数字分组。
+// 与 pi 版的差异：
+// - （有意修正）pi 第一条「test result:」模式把 `(\w+)` 当作 passed 分组，
+//   导致 `test result: ok. 5 passed; 0 failed;` 被解析成 passed=0 / failed=5。
+//   本实现按模式分别声明分组下标，取正确的数字分组。
+// - （性能）行索引与失败块放进竞技场，元素一律借用输入 `&str`；
+//   仅在需要截断时才在竞技场里生成新字符串。
 
+use std::fmt::Write;
 use std::sync::LazyLock;
 
+use bumpalo::collections::{String as ArenaString, Vec as ArenaVec};
+use bumpalo::Bump;
 use regex::Regex;
 
-use super::command_detection::matches_command_patterns;
+use phi_ext_common::arena::split_lines;
+
+use super::command_detection::matches_normalized_patterns;
 
 /// 测试类命令。
 static TEST_COMMAND_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -121,8 +128,10 @@ static FAILURE_CONTINUATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s|^-").expect("续行正则应可编译"));
 
 /// 命令是否属于测试类。
-pub fn is_test_command(command: Option<&str>) -> bool {
-    matches_command_patterns(command, &TEST_COMMAND_PATTERNS)
+///
+/// `normalized_command` 必须是 [`normalize_command_for_detection`] 的结果。
+pub fn is_test_command(normalized_command: Option<&str>) -> bool {
+    matches_normalized_patterns(normalized_command, &TEST_COMMAND_PATTERNS)
 }
 
 /// 从输出中抽取 (passed, failed, skipped)。
@@ -146,17 +155,43 @@ fn extract_test_stats(output: &str) -> Option<(u64, u64, u64)> {
     None
 }
 
+/// 按「join("\n")」语义追加一段文本。
+fn push_piece(out: &mut ArenaString<'_>, first: &mut bool, piece: &str) {
+    if !*first {
+        out.push('\n');
+    }
+    *first = false;
+    out.push_str(piece);
+}
+
+/// 截断到 `max` 个字符；未超长时直接借用输入，否则在竞技场里生成。
+fn cut<'a>(arena: &'a Bump, text: &'a str, max: usize) -> &'a str {
+    for (taken, (index, _)) in text.char_indices().enumerate() {
+        if taken == max {
+            let mut out = ArenaString::new_in(arena);
+            out.push_str(&text[..index]);
+            out.push_str("...");
+            return out.into_bump_str();
+        }
+    }
+    text
+}
+
 /// 压缩测试输出；非测试命令返回 `None`。
-pub fn aggregate_test_output(output: &str, command: Option<&str>) -> Option<String> {
-    if !is_test_command(command) {
+pub fn aggregate_test_output(
+    arena: &Bump,
+    output: &str,
+    normalized_command: Option<&str>,
+) -> Option<String> {
+    if !is_test_command(normalized_command) {
         return None;
     }
 
-    let lines: Vec<&str> = output.split('\n').collect();
+    let lines = split_lines(arena, output);
     let (mut passed, mut failed, skipped) = extract_test_stats(output).unwrap_or((0, 0, 0));
 
     if passed == 0 && failed == 0 {
-        for line in &lines {
+        for line in lines.iter().copied() {
             if FALLBACK_PASS_PATTERN.is_match(line) {
                 passed += 1;
             }
@@ -166,22 +201,22 @@ pub fn aggregate_test_output(output: &str, command: Option<&str>) -> Option<Stri
         }
     }
 
-    let mut failures: Vec<String> = Vec::new();
+    let mut failures: ArenaVec<ArenaVec<&str>> = ArenaVec::new_in(arena);
     if failed > 0 {
         let mut in_failure = false;
-        let mut current: Vec<String> = Vec::new();
+        let mut current: ArenaVec<&str> = ArenaVec::new_in(arena);
         let mut blank_count = 0usize;
 
-        for line in &lines {
+        for line in lines.iter().copied() {
             if FAILURE_START_PATTERNS
                 .iter()
                 .any(|pattern| pattern.is_match(line))
             {
                 if in_failure && !current.is_empty() {
-                    failures.push(current.join("\n"));
+                    failures.push(std::mem::replace(&mut current, ArenaVec::new_in(arena)));
                 }
                 in_failure = true;
-                current = vec![(*line).to_string()];
+                current.push(line);
                 blank_count = 0;
                 continue;
             }
@@ -191,73 +226,89 @@ pub fn aggregate_test_output(output: &str, command: Option<&str>) -> Option<Stri
             if line.trim().is_empty() {
                 blank_count += 1;
                 if blank_count >= 2 && current.len() > 3 {
-                    failures.push(std::mem::take(&mut current).join("\n"));
+                    failures.push(std::mem::replace(&mut current, ArenaVec::new_in(arena)));
                     in_failure = false;
                 } else {
-                    current.push((*line).to_string());
+                    current.push(line);
                 }
                 continue;
             }
             if FAILURE_CONTINUATION.is_match(line) {
-                current.push((*line).to_string());
+                current.push(line);
                 blank_count = 0;
                 continue;
             }
-            failures.push(std::mem::take(&mut current).join("\n"));
+            failures.push(std::mem::replace(&mut current, ArenaVec::new_in(arena)));
             in_failure = false;
         }
 
         if in_failure && !current.is_empty() {
-            failures.push(current.join("\n"));
+            failures.push(current);
         }
     }
 
-    let mut result = vec!["Test Results:".to_string()];
-    result.push(format!("   PASS: {passed} passed"));
+    let mut out = ArenaString::new_in(arena);
+    let mut first = true;
+    push_piece(&mut out, &mut first, "Test Results:");
+
+    let mut line = ArenaString::new_in(arena);
+    let _ = write!(line, "   PASS: {passed} passed");
+    push_piece(&mut out, &mut first, &line);
+
     if failed > 0 {
-        result.push(format!("   FAIL: {failed} failed"));
+        let mut line = ArenaString::new_in(arena);
+        let _ = write!(line, "   FAIL: {failed} failed");
+        push_piece(&mut out, &mut first, &line);
     }
     if skipped > 0 {
-        result.push(format!("   SKIP: {skipped} skipped"));
+        let mut line = ArenaString::new_in(arena);
+        let _ = write!(line, "   SKIP: {skipped} skipped");
+        push_piece(&mut out, &mut first, &line);
     }
 
     if failed > 0 && !failures.is_empty() {
-        result.push("\n   Failures:".to_string());
+        push_piece(&mut out, &mut first, "\n   Failures:");
         for failure in failures.iter().take(5) {
-            let failure_lines: Vec<&str> = failure.split('\n').collect();
-            let first = failure_lines.first().copied().unwrap_or("");
-            let first_cut = cut(first, 70);
-            result.push(format!("   - {first_cut}"));
-            for detail in failure_lines.iter().skip(1).take(3) {
-                if !detail.trim().is_empty() {
-                    let detail_cut = cut(detail, 65);
-                    result.push(format!("     {detail_cut}"));
+            let head = failure.first().copied().unwrap_or("");
+            let mut line = ArenaString::new_in(arena);
+            line.push_str("   - ");
+            line.push_str(cut(arena, head, 70));
+            push_piece(&mut out, &mut first, &line);
+
+            for detail in failure.iter().skip(1).take(3) {
+                if detail.trim().is_empty() {
+                    continue;
                 }
+                let mut line = ArenaString::new_in(arena);
+                line.push_str("     ");
+                line.push_str(cut(arena, detail, 65));
+                push_piece(&mut out, &mut first, &line);
             }
-            if failure_lines.len() > 4 {
-                result.push(format!("     ... ({} more lines)", failure_lines.len() - 4));
+            if failure.len() > 4 {
+                let mut line = ArenaString::new_in(arena);
+                let _ = write!(line, "     ... ({} more lines)", failure.len() - 4);
+                push_piece(&mut out, &mut first, &line);
             }
         }
         if failures.len() > 5 {
-            result.push(format!("   ... and {} more failures", failures.len() - 5));
+            let mut line = ArenaString::new_in(arena);
+            let _ = write!(line, "   ... and {} more failures", failures.len() - 5);
+            push_piece(&mut out, &mut first, &line);
         }
     }
 
-    Some(result.join("\n"))
-}
-
-/// 按字符截断到 `max`，超出时追加 `...`。
-fn cut(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let kept: String = text.chars().take(max).collect();
-    format!("{kept}...")
+    Some(out.into_bump_str().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phi_ext_common::arena::Scratch;
+
+    fn aggregate(output: &str, command: Option<&str>) -> Option<String> {
+        let scratch = Scratch::with_capacity(1024);
+        aggregate_test_output(scratch.arena(), output, command)
+    }
 
     #[test]
     fn is_test_command_should_match_common_runners() {
@@ -274,22 +325,21 @@ mod tests {
     #[test]
     fn cargo_result_line_should_map_passed_and_failed_correctly() {
         let output = "running 3 tests\ntest result: ok. 5 passed; 1 failed; 0 ignored;\n";
-        let result = aggregate_test_output(output, Some("cargo test")).expect("应压缩");
+        let result = aggregate(output, Some("cargo test")).expect("应压缩");
         assert!(result.contains("PASS: 5 passed"), "got {result}");
         assert!(result.contains("FAIL: 1 failed"), "got {result}");
     }
 
     #[test]
     fn zig_test_runner_summary_should_be_extracted() {
-        let output = "All 3 tests passed.";
-        let result = aggregate_test_output(output, Some("zig test src/main.zig")).expect("应压缩");
+        let result = aggregate("All 3 tests passed.", Some("zig test src/main.zig")).expect("应压缩");
         assert!(result.contains("PASS: 3 passed"), "got {result}");
     }
 
     #[test]
     fn zig_failing_test_should_be_collected() {
         let output = "1/2 test.add... FAIL (TestUnexpectedResult)\n  expected 3, found 4\n2/2 test.sub... OK\n1 passed; 1 failed.";
-        let result = aggregate_test_output(output, Some("zig build test")).expect("应压缩");
+        let result = aggregate(output, Some("zig build test")).expect("应压缩");
         assert!(result.contains("FAIL: 1 failed"), "got {result}");
         assert!(result.contains("Failures:"), "got {result}");
         assert!(result.contains("FAIL (TestUnexpectedResult)"), "got {result}");
@@ -298,7 +348,7 @@ mod tests {
     #[test]
     fn jest_style_counts_should_be_extracted() {
         let output = "Tests:       12 passed, 2 failed, 1 skipped";
-        let result = aggregate_test_output(output, Some("jest")).expect("应压缩");
+        let result = aggregate(output, Some("jest")).expect("应压缩");
         assert!(result.contains("PASS: 12 passed"), "got {result}");
         assert!(result.contains("FAIL: 2 failed"), "got {result}");
         assert!(result.contains("SKIP: 1 skipped"), "got {result}");
@@ -306,8 +356,7 @@ mod tests {
 
     #[test]
     fn fallback_should_count_marker_lines() {
-        let output = "✓ first\n✓ second\n✗ third";
-        let result = aggregate_test_output(output, Some("vitest")).expect("应压缩");
+        let result = aggregate("✓ first\n✓ second\n✗ third", Some("vitest")).expect("应压缩");
         assert!(result.contains("PASS: 2 passed"), "got {result}");
         assert!(result.contains("FAIL: 1 failed"), "got {result}");
     }
@@ -317,7 +366,7 @@ mod tests {
         // 注意用显式 \n 拼接：Rust 的字符串续行会吃掉下一行行首缩进，
         // 而失败块的续行判定依赖缩进。
         let output = "test result: FAILED. 0 passed; 1 failed;\nFAIL src/demo.rs\n  assertion failed: left == right\n\n\n";
-        let result = aggregate_test_output(output, Some("cargo test")).expect("应压缩");
+        let result = aggregate(output, Some("cargo test")).expect("应压缩");
         assert!(result.contains("Failures:"), "got {result}");
         assert!(result.contains("FAIL src/demo.rs"), "got {result}");
         assert!(result.contains("assertion failed"), "got {result}");
@@ -325,6 +374,14 @@ mod tests {
 
     #[test]
     fn non_test_command_should_return_none() {
-        assert!(aggregate_test_output("anything", Some("ls")).is_none());
+        assert!(aggregate("anything", Some("ls")).is_none());
+    }
+
+    #[test]
+    fn cut_should_borrow_when_within_limit_and_ellipsize_otherwise() {
+        let scratch = Scratch::with_capacity(64);
+        assert_eq!(cut(scratch.arena(), "abc", 3), "abc");
+        assert_eq!(cut(scratch.arena(), "abcd", 3), "abc...");
+        assert_eq!(cut(scratch.arena(), "中文测试", 2), "中文...");
     }
 }

@@ -17,3 +17,5 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 regex.workspace = true
+# 竞技场：单次工具输出压缩内部的临时行/记录，调用结束整体释放
+bumpalo = { workspace = true }

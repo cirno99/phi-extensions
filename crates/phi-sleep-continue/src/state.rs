@@ -169,13 +169,8 @@ pub fn shared() -> Shared {
     std::rc::Rc::new(std::cell::RefCell::new(SleepState::from_env()))
 }
 
-/// 当前 Unix 毫秒时间戳。
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+/// 当前 Unix 毫秒时间戳（复用共享实现）。
+pub use phi_ext_common::time::now_ms;
 
 /// 判断文本里是否出现某个恰好三位的状态码（`429` / `5xx` 等）。
 ///

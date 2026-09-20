@@ -11,10 +11,19 @@
 //   `Context`，无法弹窗，故不提供该模式，改为「阻止 + 让模型主动求助」。
 // - 动作指纹用 FNV-1a 64（仅作会话内去重键，不参与安全判定），
 //   而 pi 用 SHA-256。
+//
+// 性能：审批判定在**每一次工具调用**上执行，因此
+// - 动作摘要（ReviewSubject）改为惰性构造：只读工具 / 工作区内写入 /
+//   安全命令 / 白名单这些「直接放行」的路径完全不构造它；
+// - 构造时所需的哈希源字符串写进调用方复用的竞技场，且不再为
+//   非 bash 工具克隆整份入参 JSON。
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use bumpalo::collections::String as ArenaString;
+use bumpalo::Bump;
 use serde_json::Value;
 
 use crate::config::ApprovalConfig;
@@ -424,30 +433,64 @@ pub fn is_workspace_internal_path(input: &Value, cwd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 稳定序列化（对象键排序），与 pi 的 `stableStringify` 语义一致。
-pub fn stable_stringify(value: &Value) -> String {
+/// 把 JSON 字符串字面量写进竞技场缓冲（转义规则与 `JSON.stringify` 一致）。
+fn push_json_string(out: &mut ArenaString<'_>, value: &str) {
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if (control as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", control as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
+/// 稳定序列化（对象键排序）写入竞技场，与 pi 的 `stableStringify` 语义一致。
+fn write_stable(out: &mut ArenaString<'_>, value: &Value) {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+            let encoded = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+            out.push_str(&encoded);
         }
         Value::Array(items) => {
-            let inner: Vec<String> = items.iter().map(stable_stringify).collect();
-            format!("[{}]", inner.join(","))
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_stable(out, item);
+            }
+            out.push(']');
         }
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            let inner: Vec<String> = keys
-                .iter()
-                .map(|key| {
-                    let encoded_key =
-                        serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""));
-                    format!("{encoded_key}:{}", stable_stringify(&map[*key]))
-                })
-                .collect();
-            format!("{{{}}}", inner.join(","))
+            out.push('{');
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, key);
+                out.push(':');
+                write_stable(out, &map[*key]);
+            }
+            out.push('}');
         }
     }
+}
+
+/// 稳定序列化（对象键排序），结果借用竞技场。
+pub fn stable_stringify<'a>(arena: &'a Bump, value: &Value) -> &'a str {
+    let mut out = ArenaString::new_in(arena);
+    write_stable(&mut out, value);
+    out.into_bump_str()
 }
 
 /// FNV-1a 64 位哈希，输出 16 位十六进制。
@@ -463,42 +506,57 @@ fn fnv1a_64_hex(input: &str) -> String {
 }
 
 /// 构造待审动作摘要。
-pub fn create_review_subject(tool_name: &str, input: &Value, cwd: &str) -> ReviewSubject {
+///
+/// 哈希源直接在竞技场里拼装（键按 `cwd` / `input` / `toolName` 排序，
+/// 与 pi 的 `stableStringify` 结果逐字节一致），因此：
+/// - 非 bash 工具不再克隆整份入参 JSON；
+/// - 不产生中间 `Value` 与中间 `String`。
+pub fn create_review_subject(
+    arena: &Bump,
+    tool_name: &str,
+    input: &Value,
+    cwd: &str,
+) -> ReviewSubject {
     let command = (tool_name == "bash")
         .then(|| input.get("command").and_then(Value::as_str))
         .flatten();
     let path = get_path_from_input(input);
 
-    let normalized_input = match (tool_name, command) {
+    let action_summary = match (tool_name, command, path) {
+        ("bash", Some(command), _) => format!("bash: {}", truncate_inline(command, 240)),
+        (_, _, Some(path)) => format!("{tool_name}: {}", truncate_inline(path, 240)),
+        _ => format!(
+            "{tool_name}: {}",
+            truncate_inline(stable_stringify(arena, input), 240)
+        ),
+    };
+
+    let mut hash_source = ArenaString::new_in(arena);
+    hash_source.push_str("{\"cwd\":");
+    push_json_string(&mut hash_source, cwd);
+    hash_source.push_str(",\"input\":");
+    match (tool_name, command) {
+        // 只有 bash 需要「归一化 command」的副本；其余直接借用原入参。
         ("bash", Some(command)) => {
-            let mut cloned = input.clone();
-            if let Some(map) = cloned.as_object_mut() {
+            let mut normalized = input.clone();
+            if let Some(map) = normalized.as_object_mut() {
                 map.insert(
                     "command".to_string(),
                     Value::String(normalize_command(command)),
                 );
             }
-            cloned
+            write_stable(&mut hash_source, &normalized);
         }
-        _ => input.clone(),
-    };
-
-    let action_summary = match (tool_name, command, path) {
-        ("bash", Some(command), _) => format!("bash: {}", truncate_inline(command, 240)),
-        (_, _, Some(path)) => format!("{tool_name}: {}", truncate_inline(path, 240)),
-        _ => format!("{tool_name}: {}", truncate_inline(&stable_stringify(input), 240)),
-    };
-
-    let hash_source = stable_stringify(&serde_json::json!({
-        "toolName": tool_name,
-        "cwd": cwd,
-        "input": normalized_input,
-    }));
+        _ => write_stable(&mut hash_source, input),
+    }
+    hash_source.push_str(",\"toolName\":");
+    push_json_string(&mut hash_source, tool_name);
+    hash_source.push('}');
 
     ReviewSubject {
         tool_name: tool_name.to_string(),
         action_summary,
-        action_hash: fnv1a_64_hex(&hash_source),
+        action_hash: fnv1a_64_hex(hash_source.as_str()),
     }
 }
 
@@ -514,18 +572,18 @@ fn deny_reason(subject: &ReviewSubject, detail: &str) -> String {
 
 /// 评估一次工具调用。
 ///
-/// 返回命中的路由、结论与动作摘要。`Allow` 表示不拦截。
+/// 返回命中的路由、结论，以及**需要时**才构造的动作摘要
+/// （直接放行的路径返回 `None`，省掉一次入参遍历与哈希）。
 pub fn evaluate(
+    arena: &Bump,
     tool_name: &str,
     input: &Value,
     cwd: &str,
     config: &ApprovalConfig,
     store: &ApprovalStore,
-) -> (Route, Decision, ReviewSubject) {
-    let subject = create_review_subject(tool_name, input, cwd);
-
+) -> (Route, Decision, Option<ReviewSubject>) {
     if !config.enabled {
-        return (Route::Disabled, Decision::Allow, subject);
+        return (Route::Disabled, Decision::Allow, None);
     }
 
     // 显式阻止优先：即使动作看起来安全，用户点名要拦就拦。
@@ -541,27 +599,37 @@ pub fn evaluate(
     if matches_pattern_list(&deny_target, &config.deny)
         || matches_pattern_list(tool_name, &config.deny)
     {
+        let subject = create_review_subject(arena, tool_name, input, cwd);
         let detail = format!("该动作命中阻止列表（deny: {deny_target}）。");
-        return (Route::DenyList, Decision::Deny(deny_reason(&subject, &detail)), subject);
+        return (
+            Route::DenyList,
+            Decision::Deny(deny_reason(&subject, &detail)),
+            Some(subject),
+        );
     }
 
     if is_read_only_tool(tool_name) {
-        return (Route::ReadOnly, Decision::Allow, subject);
+        return (Route::ReadOnly, Decision::Allow, None);
     }
 
     if (tool_name == "write" || tool_name == "edit") && is_workspace_internal_path(input, cwd) {
-        return (Route::WorkspaceWrite, Decision::Allow, subject);
+        return (Route::WorkspaceWrite, Decision::Allow, None);
     }
 
     if is_manual_only_tool(tool_name) {
+        let subject = create_review_subject(arena, tool_name, input, cwd);
         let detail = "该工具需要人工交互，无人值守模式下无法自动批准。".to_string();
-        return (Route::ManualOnly, Decision::Deny(deny_reason(&subject, &detail)), subject);
+        return (
+            Route::ManualOnly,
+            Decision::Deny(deny_reason(&subject, &detail)),
+            Some(subject),
+        );
     }
 
     if tool_name == "bash" {
         if let Some(command) = input.get("command").and_then(Value::as_str) {
             if is_safe_read_only_command(command, config) {
-                return (Route::SafeCommand, Decision::Allow, subject);
+                return (Route::SafeCommand, Decision::Allow, None);
             }
         }
     }
@@ -578,53 +646,110 @@ pub fn evaluate(
     if matches_pattern_list(&allow_target, &config.allow)
         || matches_pattern_list(tool_name, &config.allow)
     {
-        return (Route::AllowList, Decision::Allow, subject);
+        return (Route::AllowList, Decision::Allow, None);
     }
 
+    // 从这里开始需要动作指纹。
+    let subject = create_review_subject(arena, tool_name, input, cwd);
     if store.is_exact_approved(&subject.action_hash) {
-        return (Route::SessionApproval, Decision::Allow, subject);
+        return (Route::SessionApproval, Decision::Allow, Some(subject));
     }
 
     if config.mode == crate::config::ApprovalMode::Permissive {
-        return (Route::Permissive, Decision::Allow, subject);
+        return (Route::Permissive, Decision::Allow, Some(subject));
     }
 
     let detail = format!(
         "规则无法证明该动作安全（工具 `{tool_name}`，模式 `safe`）。\
          如需放行，请让用户执行 `/sleep-approval allow {tool_name}` 或改用 `/sleep-approval permissive`。"
     );
-    (Route::Unproven, Decision::Deny(deny_reason(&subject, &detail)), subject)
+    (
+        Route::Unproven,
+        Decision::Deny(deny_reason(&subject, &detail)),
+        Some(subject),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ApprovalMode;
+    use phi_ext_common::arena::Scratch;
     use serde_json::json;
 
     fn config() -> ApprovalConfig {
         ApprovalConfig::default()
     }
 
+    /// 用一次性竞技场跑一次审批判定，返回路由与结论。
+    fn eval(
+        tool_name: &str,
+        input: &serde_json::Value,
+        cwd: &str,
+        config: &ApprovalConfig,
+        store: &ApprovalStore,
+    ) -> (Route, Decision) {
+        let scratch = Scratch::with_capacity(1024);
+        let (route, decision, _subject) =
+            evaluate(scratch.arena(), tool_name, input, cwd, config, store);
+        (route, decision)
+    }
+
+    /// 同上，但连同动作摘要一起返回。
+    fn eval_with_subject(
+        tool_name: &str,
+        input: &serde_json::Value,
+        cwd: &str,
+        config: &ApprovalConfig,
+        store: &ApprovalStore,
+    ) -> (Route, Decision, Option<ReviewSubject>) {
+        let scratch = Scratch::with_capacity(1024);
+        evaluate(scratch.arena(), tool_name, input, cwd, config, store)
+    }
+
+    fn subject(tool_name: &str, input: &serde_json::Value, cwd: &str) -> ReviewSubject {
+        let scratch = Scratch::with_capacity(1024);
+        create_review_subject(scratch.arena(), tool_name, input, cwd)
+    }
+
     #[test]
     fn readonly_tools_should_be_allowed() {
-        let (route, decision, _) = evaluate("read", &json!({"path": "a.rs"}), "/w", &config(), &ApprovalStore::default());
+        let (route, decision) = eval(
+            "read",
+            &json!({"path": "a.rs"}),
+            "/w",
+            &config(),
+            &ApprovalStore::default(),
+        );
         assert_eq!(route, Route::ReadOnly);
         assert_eq!(decision, Decision::Allow);
+    }
+
+    #[test]
+    fn allowed_paths_should_not_build_a_subject() {
+        // 直接放行的路径应返回 None，避免每次工具调用都做入参遍历与哈希。
+        let (_, _, subject) = eval_with_subject(
+            "read",
+            &json!({"path": "a.rs"}),
+            "/w",
+            &config(),
+            &ApprovalStore::default(),
+        );
+        assert!(subject.is_none());
     }
 
     #[test]
     fn workspace_writes_should_be_allowed() {
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let input = json!({ "path": format!("{cwd}/inside.rs") });
-        let (route, decision, _) = evaluate("write", &input, &cwd, &config(), &ApprovalStore::default());
+        let (route, decision) = eval("write", &input, &cwd, &config(), &ApprovalStore::default());
         assert_eq!(route, Route::WorkspaceWrite);
         assert_eq!(decision, Decision::Allow);
     }
 
     #[test]
     fn writes_outside_workspace_should_be_blocked_in_safe_mode() {
-        let (route, decision, _) = evaluate(
+        let (route, decision) = eval(
             "write",
             &json!({ "path": "/etc/passwd" }),
             "/workspace",
@@ -638,7 +763,7 @@ mod tests {
     #[test]
     fn safe_read_only_commands_should_be_allowed() {
         for command in ["pwd", "git status", "git log --oneline", "git branch --show-current"] {
-            let (route, decision, _) = evaluate(
+            let (route, decision) = eval(
                 "bash",
                 &json!({ "command": command }),
                 "/w",
@@ -660,7 +785,7 @@ mod tests {
             "git push --force",
             "sudo rm -rf /",
         ] {
-            let (_, decision, _) = evaluate(
+            let (_, decision) = eval(
                 "bash",
                 &json!({ "command": command }),
                 "/w",
@@ -673,7 +798,7 @@ mod tests {
 
     #[test]
     fn bash_lc_wrapper_should_be_unwrapped() {
-        let (route, decision, _) = evaluate(
+        let (route, decision) = eval(
             "bash",
             &json!({ "command": "bash -lc 'git status'" }),
             "/w",
@@ -688,27 +813,21 @@ mod tests {
     fn safe_command_allowlist_should_extend_builtin_rules() {
         let mut config = config();
         config.safe_command_allowlist = vec!["rg".to_string(), "fd*".to_string()];
-        let (route, _, _) = evaluate(
-            "bash",
-            &json!({ "command": "rg TODO src" }),
-            "/w",
-            &config,
-            &ApprovalStore::default(),
-        );
-        assert_eq!(route, Route::SafeCommand);
-        let (route, _, _) = evaluate(
-            "bash",
-            &json!({ "command": "fdfind x" }),
-            "/w",
-            &config,
-            &ApprovalStore::default(),
-        );
-        assert_eq!(route, Route::SafeCommand);
+        for command in ["rg TODO src", "fdfind x"] {
+            let (route, _) = eval(
+                "bash",
+                &json!({ "command": command }),
+                "/w",
+                &config,
+                &ApprovalStore::default(),
+            );
+            assert_eq!(route, Route::SafeCommand, "command {command}");
+        }
     }
 
     #[test]
     fn manual_only_tools_should_be_blocked() {
-        let (route, decision, _) = evaluate(
+        let (route, decision) = eval(
             "browser_click",
             &json!({}),
             "/w",
@@ -723,7 +842,7 @@ mod tests {
     fn deny_list_should_win_over_readonly() {
         let mut config = config();
         config.deny = vec!["read".to_string()];
-        let (route, decision, _) = evaluate(
+        let (route, decision) = eval(
             "read",
             &json!({ "path": "a.rs" }),
             "/w",
@@ -738,7 +857,7 @@ mod tests {
     fn allow_list_should_permit_otherwise_unproven_tools() {
         let mut config = config();
         config.allow = vec!["web_fetch".to_string()];
-        let (route, decision, _) = evaluate(
+        let (route, decision) = eval(
             "web_fetch",
             &json!({ "url": "https://example.com" }),
             "/w",
@@ -753,11 +872,12 @@ mod tests {
     fn session_approval_should_permit_repeat_actions() {
         let mut store = ApprovalStore::default();
         let input = json!({ "command": "make deploy" });
-        let (_, first, subject) = evaluate("bash", &input, "/w", &config(), &store);
+        let (_, first, subject) = eval_with_subject("bash", &input, "/w", &config(), &store);
         assert!(matches!(first, Decision::Deny(_)));
+        let hash = subject.expect("被阻止时应构造摘要").action_hash;
 
-        store.approve_exact(&subject.action_hash);
-        let (route, second, _) = evaluate("bash", &input, "/w", &config(), &store);
+        store.approve_exact(&hash);
+        let (route, second) = eval("bash", &input, "/w", &config(), &store);
         assert_eq!(route, Route::SessionApproval);
         assert_eq!(second, Decision::Allow);
     }
@@ -766,7 +886,7 @@ mod tests {
     fn permissive_mode_should_allow_unproven_actions() {
         let mut config = config();
         config.mode = ApprovalMode::Permissive;
-        let (route, decision, _) = evaluate(
+        let (route, decision) = eval(
             "bash",
             &json!({ "command": "make deploy" }),
             "/w",
@@ -781,7 +901,7 @@ mod tests {
     fn disabled_approval_should_not_interfere() {
         let mut config = config();
         config.enabled = false;
-        let (route, decision, _) = evaluate(
+        let (route, decision) = eval(
             "bash",
             &json!({ "command": "rm -rf /" }),
             "/w",
@@ -808,19 +928,57 @@ mod tests {
 
     #[test]
     fn stable_stringify_should_sort_keys() {
-        let a = stable_stringify(&json!({"b": 1, "a": 2}));
-        let b = stable_stringify(&json!({"a": 2, "b": 1}));
-        assert_eq!(a, b);
-        assert_eq!(a, r#"{"a":2,"b":1}"#);
+        let scratch = Scratch::with_capacity(128);
+        let arena = scratch.arena();
+        assert_eq!(stable_stringify(arena, &json!({"b": 1, "a": 2})), r#"{"a":2,"b":1}"#);
+        assert_eq!(
+            stable_stringify(arena, &json!({"a": 2, "b": 1})),
+            stable_stringify(arena, &json!({"b": 1, "a": 2}))
+        );
+    }
+
+    #[test]
+    fn stable_stringify_should_escape_like_json_stringify() {
+        let scratch = Scratch::with_capacity(256);
+        assert_eq!(
+            stable_stringify(scratch.arena(), &json!({"k": "a\"b\\c\nd\u{1}e"})),
+            r#"{"k":"a\"b\\c\nd\u0001e"}"#
+        );
+    }
+
+    #[test]
+    fn stable_stringify_should_handle_nested_and_arrays() {
+        let scratch = Scratch::with_capacity(256);
+        assert_eq!(
+            stable_stringify(scratch.arena(), &json!({"z": [1, {"y": true, "x": null}]})),
+            r#"{"z":[1,{"x":null,"y":true}]}"#
+        );
     }
 
     #[test]
     fn action_hash_should_be_stable_and_ignore_key_order() {
-        let first = create_review_subject("bash", &json!({"command": "git  status"}), "/w");
-        let second = create_review_subject("bash", &json!({"command": "git status"}), "/w");
+        let first = subject("bash", &json!({"command": "git  status"}), "/w");
+        let second = subject("bash", &json!({"command": "git status"}), "/w");
         assert_eq!(first.action_hash, second.action_hash);
         assert_eq!(first.action_hash.len(), 16);
         assert_eq!(first.action_summary, "bash: git status");
+    }
+
+    #[test]
+    fn action_hash_should_depend_on_cwd_and_extra_fields() {
+        let base = subject("bash", &json!({"command": "git status"}), "/w");
+        let other_cwd = subject("bash", &json!({"command": "git status"}), "/other");
+        let with_timeout = subject("bash", &json!({"command": "git status", "timeout": 5}), "/w");
+        assert_ne!(base.action_hash, other_cwd.action_hash);
+        assert_ne!(base.action_hash, with_timeout.action_hash);
+    }
+
+    #[test]
+    fn non_bash_subject_should_use_tool_and_path_summary() {
+        let with_path = subject("read", &json!({"path": "src/a.rs"}), "/w");
+        assert_eq!(with_path.action_summary, "read: src/a.rs");
+        let without_path = subject("web_fetch", &json!({"url": "https://x"}), "/w");
+        assert!(without_path.action_summary.starts_with("web_fetch: "), "got {}", without_path.action_summary);
     }
 
     #[test]

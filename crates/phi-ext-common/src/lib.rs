@@ -15,6 +15,7 @@ pub mod config;
 pub mod paths;
 pub mod stats;
 pub mod text;
+pub mod time;
 #[cfg(feature = "simd")]
 pub mod json;
 

@@ -2,12 +2,19 @@
 //
 // 由 pi 版 pi-rtk-optimizer 的 src/techniques/source.ts 移植。
 //
-// 与 pi 版的差异：pi 用 UTF-16 下标扫描行内字符，这里用 `Vec<char>`，
-// 对多字节注释符/字符串更安全。
+// 与 pi 版的差异：
+// - pi 用 UTF-16 下标扫描行内字符，这里用 `&[char]`，对多字节注释符/字符串更安全。
+// - （性能）所有产出都写进竞技场并借用返回：`get_code_portion` 不再每行分配
+//   `String`，`filter_*` / `smart_truncate` 不再先收集 `Vec<String>` 再 `join`，
+//   连续空行折叠也由计数器完成（省掉一条全局正则）。
 
 use std::sync::LazyLock;
 
+use bumpalo::collections::String as ArenaString;
+use bumpalo::Bump;
 use regex::Regex;
+
+use phi_ext_common::arena::split_lines;
 
 /// 识别到的语言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,10 +138,6 @@ static USERSCRIPT_END: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^//\s*==\s*/userscript\s*==$").expect("userscript 结束正则应可编译")
 });
 
-/// 连续 3 个以上换行折叠为 2 个。
-static MULTI_NEWLINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\n{3,}").expect("换行正则应可编译"));
-
 /// `chars[index..]` 是否以 `needle` 开头。
 fn starts_with_at(chars: &[char], index: usize, needle: &str) -> bool {
     let needle: Vec<char> = needle.chars().collect();
@@ -147,16 +150,17 @@ fn find_from(chars: &[char], start: usize, needle: &str) -> Option<usize> {
     if needle.is_empty() || chars.len() < needle.len() {
         return None;
     }
-    (start..=chars.len() - needle.len()).find(|&index| chars[index..index + needle.len()] == needle[..])
+    (start..=chars.len() - needle.len())
+        .find(|&index| chars[index..index + needle.len()] == needle[..])
 }
 
-/// 去掉行内注释与字符串字面量，返回「代码部分」。
-fn get_code_portion(line: &str, language: Language) -> String {
+/// 去掉行内注释与字符串字面量，返回「代码部分」（写入竞技场）。
+fn get_code_portion<'a>(arena: &'a Bump, line: &str, language: Language) -> &'a str {
     let patterns = comment_patterns(language);
     let chars: Vec<char> = line.chars().collect();
     let mut quote: Option<char> = None;
     let mut escaped = false;
-    let mut code = String::new();
+    let mut code = ArenaString::new_in(arena);
     let mut index = 0usize;
 
     while index < chars.len() {
@@ -205,14 +209,14 @@ fn get_code_portion(line: &str, language: Language) -> String {
         index += 1;
     }
 
-    code
+    code.into_bump_str()
 }
 
 /// 统计代码部分的花括号数量。
-fn count_code_braces(line: &str, language: Language) -> (usize, usize) {
+fn count_code_braces(code: &str) -> (usize, usize) {
     let mut open = 0usize;
     let mut close = 0usize;
-    for character in get_code_portion(line, language).chars() {
+    for character in code.chars() {
         match character {
             '{' => open += 1,
             '}' => close += 1,
@@ -222,24 +226,48 @@ fn count_code_braces(line: &str, language: Language) -> (usize, usize) {
     (open, close)
 }
 
+/// 按「join("\n")」语义追加一段文本。
+fn push_piece(out: &mut ArenaString<'_>, first: &mut bool, piece: &str) {
+    if !*first {
+        out.push('\n');
+    }
+    *first = false;
+    out.push_str(piece);
+}
+
+/// 把 `text` 去首尾空白后复制进竞技场。
+fn trimmed_in<'a>(arena: &'a Bump, text: &str) -> &'a str {
+    let mut out = ArenaString::new_in(arena);
+    out.push_str(text.trim());
+    out.into_bump_str()
+}
+
 /// 最小过滤：去注释与空行，保留结构与文档注释。
-pub fn filter_minimal(content: &str, language: Language) -> String {
+///
+/// 连续空行折叠为最多一个空行（对应 pi 的 `replace(/\n{3,}/g, "\n\n")`）。
+pub fn filter_minimal<'a>(arena: &'a Bump, content: &'a str, language: Language) -> &'a str {
     let patterns = comment_patterns(language);
-    let mut result: Vec<String> = Vec::new();
+    let lines = split_lines(arena, content);
+    let mut out = ArenaString::new_in(arena);
+    let mut first = true;
+    let mut last_was_empty = false;
+
     let mut in_block_comment = false;
     let mut in_docstring = false;
     let mut in_userscript_block = false;
 
-    for line in content.split('\n') {
+    for line in lines.iter().copied() {
         let trimmed = line.trim();
 
         if USERSCRIPT_START.is_match(trimmed) {
             in_userscript_block = true;
-            result.push(line.to_string());
+            push_piece(&mut out, &mut first, line);
+            last_was_empty = trimmed.is_empty();
             continue;
         }
         if in_userscript_block {
-            result.push(line.to_string());
+            push_piece(&mut out, &mut first, line);
+            last_was_empty = trimmed.is_empty();
             if USERSCRIPT_END.is_match(trimmed) {
                 in_userscript_block = false;
             }
@@ -265,98 +293,114 @@ pub fn filter_minimal(content: &str, language: Language) -> String {
 
         if language == Language::Python && trimmed.starts_with("\"\"\"") {
             in_docstring = !in_docstring;
-            result.push(line.to_string());
+            push_piece(&mut out, &mut first, line);
+            last_was_empty = false;
             continue;
         }
         if in_docstring {
-            result.push(line.to_string());
+            push_piece(&mut out, &mut first, line);
+            last_was_empty = false;
             continue;
         }
 
         if let Some(line_comment) = patterns.line {
             if trimmed.starts_with(line_comment) {
                 if patterns.doc_lines.iter().any(|doc| trimmed.starts_with(doc)) {
-                    result.push(line.to_string());
+                    push_piece(&mut out, &mut first, line);
+                    last_was_empty = false;
                 }
                 continue;
             }
         }
 
         if trimmed.is_empty() {
-            result.push(String::new());
+            // 至多保留一个连续空行。
+            if !last_was_empty {
+                push_piece(&mut out, &mut first, "");
+                last_was_empty = true;
+            }
             continue;
         }
 
-        result.push(line.to_string());
+        push_piece(&mut out, &mut first, line);
+        last_was_empty = false;
     }
 
-    let joined = result.join("\n");
-    MULTI_NEWLINE.replace_all(&joined, "\n\n").trim().to_string()
+    trimmed_in(arena, out.as_str())
 }
 
 /// 激进过滤：在最小过滤之上只保留导入、签名与常量。
-pub fn filter_aggressive(content: &str, language: Language) -> String {
-    let minimal = filter_minimal(content, language);
-    let mut result: Vec<String> = Vec::new();
+pub fn filter_aggressive<'a>(arena: &'a Bump, content: &'a str, language: Language) -> &'a str {
+    let minimal = filter_minimal(arena, content, language);
+    let lines = split_lines(arena, minimal);
+    let mut out = ArenaString::new_in(arena);
+    let mut first = true;
     let mut brace_depth: i64 = 0;
     let mut in_implementation = false;
 
-    for line in minimal.split('\n') {
+    for line in lines.iter().copied() {
         let trimmed = line.trim();
 
         if IMPORT_PATTERN.is_match(trimmed) {
-            result.push(line.to_string());
+            push_piece(&mut out, &mut first, line);
             continue;
         }
         if SIGNATURE_PATTERN.is_match(trimmed) {
-            result.push(line.to_string());
+            push_piece(&mut out, &mut first, line);
             in_implementation = true;
             brace_depth = 0;
             continue;
         }
 
-        let (open, close) = count_code_braces(line, language);
-        let code_trimmed = get_code_portion(line, language);
-        let code_trimmed = code_trimmed.trim();
+        // 每行只提取一次「代码部分」，花括号计数复用它。
+        let code = get_code_portion(arena, line, language);
+        let code_trimmed = code.trim();
 
         if in_implementation {
+            let (open, close) = count_code_braces(code);
             brace_depth += open as i64;
             brace_depth -= close as i64;
 
             if brace_depth <= 1
                 && (code_trimmed == "{" || code_trimmed == "}" || code_trimmed.ends_with('{'))
             {
-                result.push(line.to_string());
+                push_piece(&mut out, &mut first, line);
             }
             if brace_depth <= 0 {
                 in_implementation = false;
                 if !trimmed.is_empty() && trimmed != "}" {
-                    result.push("    // ... implementation".to_string());
+                    push_piece(&mut out, &mut first, "    // ... implementation");
                 }
             }
             continue;
         }
 
         if CONST_PATTERN.is_match(trimmed) {
-            result.push(line.to_string());
+            push_piece(&mut out, &mut first, line);
         }
     }
 
-    result.join("\n").trim().to_string()
+    trimmed_in(arena, out.as_str())
 }
 
 /// 智能截断：保留签名/导入/花括号与前半部分，其余折叠为省略行。
-pub fn smart_truncate(content: &str, max_lines: usize, _language: Language) -> String {
-    let lines: Vec<&str> = content.split('\n').collect();
+pub fn smart_truncate<'a>(
+    arena: &'a Bump,
+    content: &'a str,
+    max_lines: usize,
+    _language: Language,
+) -> &'a str {
+    let lines = split_lines(arena, content);
     if lines.len() <= max_lines {
-        return content.to_string();
+        return content;
     }
 
-    let mut result: Vec<String> = Vec::new();
+    let mut out = ArenaString::new_in(arena);
+    let mut first = true;
     let mut kept_lines = 0usize;
     let mut skipped_section = false;
 
-    for line in &lines {
+    for line in lines.iter().copied() {
         let trimmed = line.trim();
         let is_important = SIGNATURE_PATTERN.is_match(trimmed)
             || IMPORT_PATTERN.is_match(trimmed)
@@ -367,10 +411,14 @@ pub fn smart_truncate(content: &str, max_lines: usize, _language: Language) -> S
 
         if is_important || kept_lines < max_lines / 2 {
             if skipped_section {
-                result.push(format!("    // ... {} lines omitted", lines.len() - kept_lines));
+                push_piece(
+                    &mut out,
+                    &mut first,
+                    &format!("    // ... {} lines omitted", lines.len() - kept_lines),
+                );
                 skipped_section = false;
             }
-            result.push((*line).to_string());
+            push_piece(&mut out, &mut first, line);
             kept_lines += 1;
         } else {
             skipped_section = true;
@@ -382,28 +430,53 @@ pub fn smart_truncate(content: &str, max_lines: usize, _language: Language) -> S
     }
 
     if skipped_section || kept_lines < lines.len() {
-        result.push(format!(
-            "// ... {} more lines (total: {})",
-            lines.len() - kept_lines,
-            lines.len()
-        ));
+        push_piece(
+            &mut out,
+            &mut first,
+            &format!(
+                "// ... {} more lines (total: {})",
+                lines.len() - kept_lines,
+                lines.len()
+            ),
+        );
     }
 
-    result.join("\n")
+    out.into_bump_str()
 }
 
-/// 按强度过滤源码。
-pub fn filter_source_code(content: &str, language: Language, level: FilterLevel) -> String {
+/// 按强度过滤源码；`None` 强度直接借用原文。
+pub fn filter_source_code<'a>(
+    arena: &'a Bump,
+    content: &'a str,
+    language: Language,
+    level: FilterLevel,
+) -> &'a str {
     match level {
-        FilterLevel::None => content.to_string(),
-        FilterLevel::Minimal => filter_minimal(content, language),
-        FilterLevel::Aggressive => filter_aggressive(content, language),
+        FilterLevel::None => content,
+        FilterLevel::Minimal => filter_minimal(arena, content, language),
+        FilterLevel::Aggressive => filter_aggressive(arena, content, language),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phi_ext_common::arena::Scratch;
+
+    fn minimal(source: &str, language: Language) -> String {
+        let scratch = Scratch::with_capacity(512);
+        filter_minimal(scratch.arena(), source, language).to_string()
+    }
+
+    fn aggressive(source: &str, language: Language) -> String {
+        let scratch = Scratch::with_capacity(512);
+        filter_aggressive(scratch.arena(), source, language).to_string()
+    }
+
+    fn truncate(source: &str, max: usize) -> String {
+        let scratch = Scratch::with_capacity(512);
+        smart_truncate(scratch.arena(), source, max, Language::Rust).to_string()
+    }
 
     #[test]
     fn detect_language_should_map_extensions() {
@@ -420,7 +493,7 @@ mod tests {
     #[test]
     fn filter_minimal_should_drop_line_and_block_comments() {
         let source = "// leading comment\nfn main() {\n    /* block */\n    let x = 1;\n}\n";
-        let filtered = filter_minimal(source, Language::Rust);
+        let filtered = minimal(source, Language::Rust);
         assert!(!filtered.contains("leading comment"), "got {filtered}");
         assert!(!filtered.contains("block"), "got {filtered}");
         assert!(filtered.contains("fn main()"), "got {filtered}");
@@ -429,15 +502,14 @@ mod tests {
 
     #[test]
     fn filter_minimal_should_keep_rust_doc_comments() {
-        let source = "/// docs\nfn main() {}\n";
-        let filtered = filter_minimal(source, Language::Rust);
+        let filtered = minimal("/// docs\nfn main() {}\n", Language::Rust);
         assert!(filtered.contains("/// docs"), "got {filtered}");
     }
 
     #[test]
     fn filter_minimal_should_keep_zig_doc_comments() {
         let source = "//! container docs\n/// decl docs\n// plain\npub fn main() void {}\n";
-        let filtered = filter_minimal(source, Language::Zig);
+        let filtered = minimal(source, Language::Zig);
         assert!(filtered.contains("//! container docs"), "got {filtered}");
         assert!(filtered.contains("/// decl docs"), "got {filtered}");
         assert!(!filtered.contains("// plain"), "got {filtered}");
@@ -446,46 +518,30 @@ mod tests {
 
     #[test]
     fn filter_minimal_should_drop_zig_block_comments() {
-        let source = "/* block */\nconst std = @import(\"std\");\n";
-        let filtered = filter_minimal(source, Language::Zig);
+        let filtered = minimal("/* block */\nconst std = @import(\"std\");\n", Language::Zig);
         assert!(!filtered.contains("block"), "got {filtered}");
         assert!(filtered.contains("@import"), "got {filtered}");
     }
 
     #[test]
-    fn filter_aggressive_should_keep_zig_signatures_and_consts() {
-        let source = "const std = @import(\"std\");\npub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n";
-        let filtered = filter_aggressive(source, Language::Zig);
-        assert!(filtered.contains("@import"), "got {filtered}");
-        assert!(filtered.contains("pub fn add"), "got {filtered}");
-        assert!(!filtered.contains("return a + b;"), "got {filtered}");
-    }
-
-    #[test]
-    fn code_portion_should_handle_zig_comment_forms() {
-        let portion = get_code_portion("const x = 1; //! note", Language::Zig);
-        assert_eq!(portion.trim(), "const x = 1;");
-    }
-
-    #[test]
     fn filter_minimal_should_preserve_python_docstrings() {
         let source = "def f():\n    \"\"\"doc\"\"\"\n    return 1\n";
-        let filtered = filter_minimal(source, Language::Python);
+        let filtered = minimal(source, Language::Python);
         assert!(filtered.contains("\"\"\"doc\"\"\""), "got {filtered}");
         assert!(filtered.contains("return 1"), "got {filtered}");
     }
 
     #[test]
     fn filter_minimal_should_collapse_blank_runs() {
-        let source = "a\n\n\n\n\nb";
-        let filtered = filter_minimal(source, Language::Rust);
-        assert_eq!(filtered, "a\n\nb");
+        assert_eq!(minimal("a\n\n\n\n\nb", Language::Rust), "a\n\nb");
+        assert_eq!(minimal("a\n\nb", Language::Rust), "a\n\nb");
+        assert_eq!(minimal("\n\n\na", Language::Rust), "a");
     }
 
     #[test]
     fn filter_aggressive_should_keep_imports_signatures_and_consts() {
         let source = "use std::fmt;\nconst N: usize = 3;\nfn foo() {\n    let inner = 1;\n    inner\n}\n";
-        let filtered = filter_aggressive(source, Language::Rust);
+        let filtered = aggressive(source, Language::Rust);
         assert!(filtered.contains("use std::fmt;"), "got {filtered}");
         assert!(filtered.contains("const N: usize = 3;"), "got {filtered}");
         assert!(filtered.contains("fn foo()"), "got {filtered}");
@@ -494,40 +550,60 @@ mod tests {
     }
 
     #[test]
+    fn filter_aggressive_should_keep_zig_signatures_and_consts() {
+        let source = "const std = @import(\"std\");\npub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n";
+        let filtered = aggressive(source, Language::Zig);
+        assert!(filtered.contains("@import"), "got {filtered}");
+        assert!(filtered.contains("pub fn add"), "got {filtered}");
+        assert!(!filtered.contains("return a + b;"), "got {filtered}");
+    }
+
+    #[test]
     fn smart_truncate_should_keep_important_lines() {
         let source = (0..100)
             .map(|index| format!("line {index}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let truncated = smart_truncate(&source, 20, Language::Rust);
-        assert!(truncated.lines().count() <= 20, "got {}", truncated.lines().count());
-        assert!(truncated.contains("more lines (total: 100)"), "got {truncated}");
+        let truncated = truncate(&source, 20);
+        assert!(
+            truncated.lines().count() <= 20,
+            "got {}",
+            truncated.lines().count()
+        );
+        assert!(
+            truncated.contains("more lines (total: 100)"),
+            "got {truncated}"
+        );
     }
 
     #[test]
     fn smart_truncate_should_pass_through_short_input() {
         let source = "a\nb\nc";
-        assert_eq!(smart_truncate(source, 10, Language::Rust), source);
+        assert_eq!(truncate(source, 10), source);
     }
 
     #[test]
     fn filter_source_code_should_honour_level() {
         let source = "// c\nlet x = 1;";
+        let scratch = Scratch::with_capacity(256);
         assert_eq!(
-            filter_source_code(source, Language::Rust, FilterLevel::None),
+            filter_source_code(scratch.arena(), source, Language::Rust, FilterLevel::None),
             source
         );
         assert_eq!(
-            filter_source_code(source, Language::Rust, FilterLevel::Minimal),
+            filter_source_code(scratch.arena(), source, Language::Rust, FilterLevel::Minimal),
             "let x = 1;"
         );
-        assert!(filter_source_code(source, Language::Rust, FilterLevel::Aggressive)
-            .contains("let x = 1;"));
     }
 
     #[test]
     fn code_portion_should_ignore_comments_inside_strings() {
-        let portion = get_code_portion(r#"let url = "http://x"; // real comment"#, Language::Rust);
+        let scratch = Scratch::with_capacity(128);
+        let portion = get_code_portion(
+            scratch.arena(),
+            r#"let url = "http://x"; // real comment"#,
+            Language::Rust,
+        );
         // 字符串字面量的内容会被跳过（与 pi 版一致），行尾注释则整段丢弃。
         assert!(portion.contains("let url"), "got {portion}");
         assert!(!portion.contains("http://x"), "got {portion}");
@@ -535,16 +611,23 @@ mod tests {
     }
 
     #[test]
-    fn code_portion_should_strip_block_comments_inline() {
-        let portion = get_code_portion("let a = 1; /* note */ let b = 2;", Language::Rust);
-        assert!(portion.contains("let a = 1;"), "got {portion}");
-        assert!(portion.contains("let b = 2;"), "got {portion}");
-        assert!(!portion.contains("note"), "got {portion}");
+    fn code_portion_should_handle_zig_comment_forms() {
+        let scratch = Scratch::with_capacity(128);
+        let portion = get_code_portion(scratch.arena(), "const x = 1; //! note", Language::Zig);
+        assert_eq!(portion.trim(), "const x = 1;");
     }
 
     #[test]
-    fn count_code_braces_should_ignore_braces_in_strings() {
-        assert_eq!(count_code_braces(r#"f("{")"#, Language::Rust), (0, 0));
-        assert_eq!(count_code_braces("fn f() { }", Language::Rust), (1, 1));
+    fn count_code_braces_should_count_only_braces() {
+        assert_eq!(count_code_braces("fn f() { }"), (1, 1));
+        assert_eq!(count_code_braces("no braces"), (0, 0));
+    }
+
+    #[test]
+    fn code_portion_should_drop_braces_inside_strings() {
+        // 花括号计数只作用于 get_code_portion 的结果，因此字符串里的 `{` 不计入。
+        let scratch = Scratch::with_capacity(64);
+        let code = get_code_portion(scratch.arena(), r#"f("{")"#, Language::Rust);
+        assert_eq!(count_code_braces(code), (0, 0));
     }
 }

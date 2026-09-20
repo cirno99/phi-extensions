@@ -98,6 +98,20 @@ scripts/
 - 动作指纹用 FNV-1a 64（仅作会话内去重键），pi 用 SHA-256。
 - 连续拒绝达到 `maxConsecutiveDenials` 时，阻止理由会要求模型停下来求助。
 
+### 性能优化（跨扩展）
+
+审查后落地的优化，详见 README 的「性能」一节：
+
+- **rtk-optimizer**：build 过滤的 19 条逐行正则改为首字节派发（实测该步 3.1x、
+  全流程 1.48x）；竞技场接进压缩管线；命令只归一化一次（6 → 1）；去掉每次
+  `tool_result` 的 `config.clone()`；linter / search 加零成本预筛。
+- **sleep-continue**：审批判定用竞技场；动作摘要惰性构造，直接放行路径不再
+  遍历入参或算哈希。
+- **phi-ext-common**：新增 `time::now_ms`（收敛 4 份实现）与 `arena::split_lines`；
+  `ansi` 增加 `strip_ansi_fast` 并补 CSI 私有参数的回归测试。
+- **去重**：rtk 自带的 ANSI 正则实现已删除（既慢又漏剥 `ESC[?25l` 这类序列），
+  统一走 `phi-ext-common::ansi` 的单遍字节扫描。
+
 ### rtk-optimizer
 
 - 输出压缩技术（ansi / build / test / git / linter / search / source /

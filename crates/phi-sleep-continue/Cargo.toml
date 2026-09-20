@@ -16,3 +16,5 @@ phi-ext-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# 竞技场：单次审批判定的临时内存
+bumpalo.workspace = true
