@@ -213,7 +213,7 @@ pub struct NudgeState {
     pub baseline_tokens: u64,
     /// 锚点（保留字段）。
     #[serde(default)]
-    pub anchors: BTreeMap<String, serde_json::Value>,
+    pub anchors: BTreeMap<String, phi_ext_common::json::Value>,
     /// 各层级的节奏基线。
     #[serde(rename = "lastShownByTier")]
     pub last_shown_by_tier: BTreeMap<u8, u64>,
@@ -479,9 +479,23 @@ pub struct AbsorbConfig {
     /// 上下文使用率门槛。
     #[serde(rename = "contextThresholdPct")]
     pub context_threshold_pct: f64,
-    /// 排除的工具名模式。
-    #[serde(rename = "excludeTools")]
+    /// 排除的工具名模式（`*` 通配 / 子串）。
+    #[serde(default, rename = "excludeTools")]
     pub exclude_tools: Vec<String>,
+    /// 保留的头部字符数。
+    #[serde(default = "default_absorb_prefix", rename = "keepPrefixChars")]
+    pub keep_prefix_chars: usize,
+    /// 保留的尾部字符数。
+    #[serde(default = "default_absorb_suffix", rename = "keepSuffixChars")]
+    pub keep_suffix_chars: usize,
+}
+
+fn default_absorb_prefix() -> usize {
+    2000
+}
+
+fn default_absorb_suffix() -> usize {
+    800
 }
 
 impl Default for AbsorbConfig {
@@ -492,6 +506,8 @@ impl Default for AbsorbConfig {
             min_tool_tokens: 1000,
             context_threshold_pct: 0.0,
             exclude_tools: Vec::new(),
+            keep_prefix_chars: default_absorb_prefix(),
+            keep_suffix_chars: default_absorb_suffix(),
         }
     }
 }
@@ -730,6 +746,11 @@ pub struct NudgeBreakdown {
     pub max_pending: u64,
     /// 压力带最小收益。
     pub min_pressure_benefit: u64,
+    /// 判定首次提醒用的层级标记：`Some(t)` 表示本次提醒是会话中该层级第一次。
+    ///
+    /// 完整 T2/T3 规则只在首次携带（提醒文本会永久留在会话历史里，重复携带
+    /// 几百 token 是纯亏损）。
+    pub first_by_tier: Option<CompressionTier>,
 }
 
 /// 应用压缩的结果。
@@ -763,6 +784,8 @@ pub struct ProcessTurnOutcome {
     pub state: CompressionState,
     /// 提醒决策。
     pub nudge: Option<NudgeDecision>,
+    /// 渲染后的上下文细分（供提醒文本展示）。
+    pub context_breakdown: Option<crate::nudge::ContextBreakdown>,
     /// 终端逃逸信号。
     pub terminal_escape: Option<TerminalEscapeSignal>,
     /// 截断被跳过时的说明。

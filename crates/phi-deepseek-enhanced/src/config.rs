@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use phi_ext_common::json::{Value, ValueAsArray, ValueAsScalar, ValueObjectAccess};
 
 use phi_ext_common::config::{load_strict, save_atomic, to_bool, ConfigError};
 use phi_ext_common::paths;
@@ -32,7 +32,9 @@ pub struct Config {
     /// 上下文压缩后是否重新注入锚点（压缩会丢弃早先的用户消息）。
     pub reanchor_after_compact: bool,
     /// 是否剥离用户消息开头的「Today / current working directory」系统提醒。
-    /// 原扩展靠它维持前缀缓存稳定。
+    ///
+    /// 默认关闭：当前 phi 宿主已不再注入这种提醒（实测所有会话的 user 消息
+    /// 均未出现该形态），开启后是纯空转。检测到时仍可手动 `/deepseek strip on`。
     pub strip_date_cwd_reminder: bool,
     /// Eternal Minimal 运行时守卫：阻止对非核心工具的直接调用。
     ///
@@ -54,7 +56,7 @@ impl Default for Config {
             enabled: true,
             inject_anchor: true,
             reanchor_after_compact: true,
-            strip_date_cwd_reminder: true,
+            strip_date_cwd_reminder: false,
             minimal: false,
             transport: true,
             core_tools: DEFAULT_CORE_TOOLS.iter().map(|s| s.to_string()).collect(),
@@ -91,24 +93,18 @@ pub fn normalize(raw: &Value) -> Config {
         }
     };
     Config {
-        enabled: to_bool(raw.get("enabled").unwrap_or(&Value::Null), defaults.enabled),
-        inject_anchor: to_bool(
-            raw.get("injectAnchor").unwrap_or(&Value::Null),
-            defaults.inject_anchor,
-        ),
+        enabled: to_bool(raw.get("enabled"), defaults.enabled),
+        inject_anchor: to_bool(raw.get("injectAnchor"), defaults.inject_anchor),
         reanchor_after_compact: to_bool(
-            raw.get("reanchorAfterCompact").unwrap_or(&Value::Null),
+            raw.get("reanchorAfterCompact"),
             defaults.reanchor_after_compact,
         ),
         strip_date_cwd_reminder: to_bool(
-            raw.get("stripDateCwdReminder").unwrap_or(&Value::Null),
+            raw.get("stripDateCwdReminder"),
             defaults.strip_date_cwd_reminder,
         ),
-        minimal: to_bool(raw.get("minimal").unwrap_or(&Value::Null), defaults.minimal),
-        transport: to_bool(
-            raw.get("transport").unwrap_or(&Value::Null),
-            defaults.transport,
-        ),
+        minimal: to_bool(raw.get("minimal"), defaults.minimal),
+        transport: to_bool(raw.get("transport"), defaults.transport),
         core_tools: strings(raw.get("coreTools"), &defaults.core_tools),
         transport_tools: strings(raw.get("transportTools"), &defaults.transport_tools),
     }
@@ -133,14 +129,14 @@ pub fn load(path: &Path) -> (Config, Option<String>) {
 
 /// 原子保存配置（写入前先归一化）。
 pub fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
-    let normalized = normalize(&serde_json::to_value(config)?);
+    let normalized = normalize(&phi_ext_common::json::to_value(config)?);
     save_atomic(path, &normalized)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use phi_ext_common::json::json;
 
     #[test]
     fn defaults_should_match_upstream_intent() {
@@ -148,7 +144,8 @@ mod tests {
         assert!(config.enabled);
         assert!(config.inject_anchor);
         assert!(config.reanchor_after_compact);
-        assert!(config.strip_date_cwd_reminder);
+        // 宿主已不再注入 Today/cwd 提醒，默认关闭以避免空转（见字段注释）。
+        assert!(!config.strip_date_cwd_reminder);
         // Eternal Minimal 守卫在 phi 中默认关闭（见文件头注释）。
         assert!(!config.minimal);
         assert!(config.transport);

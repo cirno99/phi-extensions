@@ -421,11 +421,19 @@ pub fn merge_ranges_to_threshold(
             batch_chars = 0;
         }
     }
-    if !batch.is_empty() && !result.is_empty() {
-        let prev = result.pop().unwrap();
-        let mut merged_batch = vec![prev];
-        merged_batch.extend(batch);
-        result.push(merge_batch(&merged_batch));
+    if !batch.is_empty() {
+        if let Some(prev) = result.pop() {
+            let mut merged_batch = vec![prev];
+            merged_batch.extend(batch);
+            result.push(merge_batch(&merged_batch));
+        } else {
+            // 整批都没跨过阈值：仍要返回它（而不是空 vec）。
+            //
+            // 旧实现只在 `!result.is_empty()` 时并入，于是首轮会话（累计字符 <
+            // minCompressRange）会得到空的 recommended_ranges，T1 待压缩量恒为 0，
+            // nudge 永不触发——压缩永远开不了头。
+            result.push(merge_batch(&batch));
+        }
     }
     result
 }
@@ -510,6 +518,22 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].start_ref, "m00001");
         assert_eq!(merged[0].end_ref, "m00002");
+    }
+
+    /// 回归：整批都未跨过阈值时也必须返回它，否则首轮会话永远不会被提醒压缩。
+    #[test]
+    fn merge_ranges_should_keep_a_batch_below_threshold() {
+        let ranges = vec![CompressibleRange {
+            start_ref: "m00001".into(),
+            end_ref: "m00002".into(),
+            count: 2,
+            tokens: 100,
+            chars: Some(100),
+            ..Default::default()
+        }];
+        let merged = merge_ranges_to_threshold(&ranges, 5000);
+        assert_eq!(merged.len(), 1, "低于阈值的一批不应被吞掉");
+        assert_eq!(merged[0].start_ref, "m00001");
     }
 
     #[test]

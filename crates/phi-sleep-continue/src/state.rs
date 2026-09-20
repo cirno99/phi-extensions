@@ -13,6 +13,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use phi_ext_common::json::{Value, ValueAsArray, ValueAsScalar, ValueObjectAccess};
+
 use crate::approval::{ApprovalStore, Route};
 use crate::config::{self, ApprovalConfig};
 
@@ -246,16 +248,16 @@ pub fn is_retryable(text: &str) -> bool {
 ///
 /// 入参形如 `{ "questions": [ { "question": "...", "options": [ {"label": "..."} ] } ] }`。
 /// 无法识别时返回 `None`。
-pub fn summarize_recommended_choices(input: &serde_json::Value) -> Option<String> {
+pub fn summarize_recommended_choices(input: &Value) -> Option<String> {
     let questions = input.get("questions")?.as_array()?;
     let mut lines = Vec::new();
     for question in questions {
         let text = question
             .get("question")
             .or_else(|| question.get("prompt"))
-            .and_then(serde_json::Value::as_str)
+            .and_then(Value::as_str)
             .unwrap_or("");
-        let Some(options) = question.get("options").and_then(serde_json::Value::as_array) else {
+        let Some(options) = question.get("options").and_then(Value::as_array) else {
             continue;
         };
         let Some(first) = options.first() else {
@@ -264,7 +266,7 @@ pub fn summarize_recommended_choices(input: &serde_json::Value) -> Option<String
         let label = first
             .get("label")
             .or_else(|| first.get("value"))
-            .and_then(serde_json::Value::as_str)
+            .and_then(Value::as_str)
             .unwrap_or("");
         lines.push(format!("-「{text}」→ 已选推荐项「{label}」"));
     }
@@ -295,7 +297,7 @@ pub fn question_block_reason(state: &SleepState, summary: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use phi_ext_common::json::json;
 
     #[test]
     fn is_retryable_should_match_429_and_5xx() {

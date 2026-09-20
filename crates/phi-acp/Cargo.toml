@@ -14,7 +14,6 @@ path = "src/main.rs"
 phi-ext.workspace = true
 phi-ext-common.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 # 竞技场：单次 processTurn / 压缩管线内部的临时分配
 bumpalo = { workspace = true }

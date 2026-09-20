@@ -10,9 +10,9 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use phi_ext_common::json::{Value, ValueObjectAccess};
 
-use phi_ext_common::config::{load_strict, save_atomic, to_bool, to_enum, to_int, ConfigError};
+use phi_ext_common::config::{child, load_strict, save_atomic, to_bool, to_enum, to_int, ConfigError};
 use phi_ext_common::paths;
 
 /// 扩展名（同时作为 `~/.phi/extensions/<name>/` 的目录名）。
@@ -148,10 +148,10 @@ impl Default for RtkIntegrationConfig {
 /// 此时读压缩、源码过滤、智能截断三项按「旧默认」取 `true` / `true` / `minimal`。
 pub fn normalize(raw: &Value) -> RtkIntegrationConfig {
     let defaults = RtkIntegrationConfig::default();
-    let compaction_source = raw.get("outputCompaction").unwrap_or(&Value::Null);
-    let read_source = compaction_source.get("readCompaction");
-    let truncate_source = compaction_source.get("truncate").unwrap_or(&Value::Null);
-    let smart_source = compaction_source.get("smartTruncate").unwrap_or(&Value::Null);
+    let compaction_source = raw.get("outputCompaction");
+    let read_source = child(compaction_source, "readCompaction");
+    let truncate_source = child(compaction_source, "truncate");
+    let smart_source = child(compaction_source, "smartTruncate");
 
     let has_read_compaction = read_source.is_some();
     let legacy = !has_read_compaction;
@@ -173,72 +173,49 @@ pub fn normalize(raw: &Value) -> RtkIntegrationConfig {
 
     let dc = &defaults.output_compaction;
     RtkIntegrationConfig {
-        enabled: to_bool(
-            raw.get("enabled").unwrap_or(&Value::Null),
-            defaults.enabled,
-        ),
+        enabled: to_bool(raw.get("enabled"), defaults.enabled),
         mode: to_enum(
-            raw.get("mode").unwrap_or(&Value::Null),
+            raw.get("mode"),
             &[("rewrite", RtkMode::Rewrite), ("suggest", RtkMode::Suggest)],
             defaults.mode,
         ),
         guard_when_rtk_missing: to_bool(
-            raw.get("guardWhenRtkMissing").unwrap_or(&Value::Null),
+            raw.get("guardWhenRtkMissing"),
             defaults.guard_when_rtk_missing,
         ),
         show_rewrite_notifications: to_bool(
-            raw.get("showRewriteNotifications").unwrap_or(&Value::Null),
+            raw.get("showRewriteNotifications"),
             defaults.show_rewrite_notifications,
         ),
         output_compaction: OutputCompaction {
-            enabled: to_bool(
-                compaction_source.get("enabled").unwrap_or(&Value::Null),
-                dc.enabled,
-            ),
-            strip_ansi: to_bool(
-                compaction_source.get("stripAnsi").unwrap_or(&Value::Null),
-                dc.strip_ansi,
-            ),
+            enabled: to_bool(child(compaction_source, "enabled"), dc.enabled),
+            strip_ansi: to_bool(child(compaction_source, "stripAnsi"), dc.strip_ansi),
             read_compaction: ReadCompaction {
                 enabled: if has_read_compaction {
-                    to_bool(
-                        read_source
-                            .and_then(|v| v.get("enabled"))
-                            .unwrap_or(&Value::Null),
-                        dc.read_compaction.enabled,
-                    )
+                    to_bool(child(read_source, "enabled"), dc.read_compaction.enabled)
                 } else {
                     true
                 },
             },
             source_code_filtering_enabled: to_bool(
-                compaction_source
-                    .get("sourceCodeFilteringEnabled")
-                    .unwrap_or(&Value::Null),
+                child(compaction_source, "sourceCodeFilteringEnabled"),
                 source_filtering_fallback,
             ),
             preserve_exact_skill_reads: to_bool(
-                compaction_source
-                    .get("preserveExactSkillReads")
-                    .unwrap_or(&Value::Null),
+                child(compaction_source, "preserveExactSkillReads"),
                 dc.preserve_exact_skill_reads,
             ),
             truncate: Truncate {
-                enabled: to_bool(
-                    truncate_source.get("enabled").unwrap_or(&Value::Null),
-                    dc.truncate.enabled,
-                ),
+                enabled: to_bool(child(truncate_source, "enabled"), dc.truncate.enabled),
                 max_chars: to_int(
-                    truncate_source.get("maxChars").unwrap_or(&Value::Null),
+                    child(truncate_source, "maxChars"),
                     1_000,
                     200_000,
                     i64::from(dc.truncate.max_chars),
                 ) as u32,
             },
             source_code_filtering: to_enum(
-                compaction_source
-                    .get("sourceCodeFiltering")
-                    .unwrap_or(&Value::Null),
+                child(compaction_source, "sourceCodeFiltering"),
                 &[
                     ("none", SourceFilterLevel::None),
                     ("minimal", SourceFilterLevel::Minimal),
@@ -248,50 +225,38 @@ pub fn normalize(raw: &Value) -> RtkIntegrationConfig {
             ),
             smart_truncate: SmartTruncate {
                 enabled: to_bool(
-                    smart_source.get("enabled").unwrap_or(&Value::Null),
+                    child(smart_source, "enabled"),
                     smart_truncate_enabled_fallback,
                 ),
                 max_lines: to_int(
-                    smart_source.get("maxLines").unwrap_or(&Value::Null),
+                    child(smart_source, "maxLines"),
                     40,
                     4_000,
                     i64::from(dc.smart_truncate.max_lines),
                 ) as u32,
             },
             aggregate_test_output: to_bool(
-                compaction_source
-                    .get("aggregateTestOutput")
-                    .unwrap_or(&Value::Null),
+                child(compaction_source, "aggregateTestOutput"),
                 dc.aggregate_test_output,
             ),
             filter_build_output: to_bool(
-                compaction_source
-                    .get("filterBuildOutput")
-                    .unwrap_or(&Value::Null),
+                child(compaction_source, "filterBuildOutput"),
                 dc.filter_build_output,
             ),
             compact_git_output: to_bool(
-                compaction_source
-                    .get("compactGitOutput")
-                    .unwrap_or(&Value::Null),
+                child(compaction_source, "compactGitOutput"),
                 dc.compact_git_output,
             ),
             aggregate_linter_output: to_bool(
-                compaction_source
-                    .get("aggregateLinterOutput")
-                    .unwrap_or(&Value::Null),
+                child(compaction_source, "aggregateLinterOutput"),
                 dc.aggregate_linter_output,
             ),
             group_search_output: to_bool(
-                compaction_source
-                    .get("groupSearchOutput")
-                    .unwrap_or(&Value::Null),
+                child(compaction_source, "groupSearchOutput"),
                 dc.group_search_output,
             ),
             track_savings: to_bool(
-                compaction_source
-                    .get("trackSavings")
-                    .unwrap_or(&Value::Null),
+                child(compaction_source, "trackSavings"),
                 dc.track_savings,
             ),
         },
@@ -332,7 +297,7 @@ pub fn load(path: &Path) -> LoadOutcome {
 
 /// 原子保存配置（写入前先归一化）。
 pub fn save(config: &RtkIntegrationConfig, path: &Path) -> Result<(), ConfigError> {
-    let normalized = normalize(&serde_json::to_value(config)?);
+    let normalized = normalize(&phi_ext_common::json::to_value(config)?);
     save_atomic(path, &normalized)
 }
 
@@ -348,7 +313,7 @@ pub fn ensure_exists(path: &Path) -> Result<bool, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use phi_ext_common::json::json;
 
     #[test]
     fn defaults_should_match_pi_version() {
@@ -463,7 +428,7 @@ mod tests {
 
     #[test]
     fn serialized_keys_should_be_camel_case() {
-        let value = serde_json::to_value(RtkIntegrationConfig::default()).expect("序列化应成功");
+        let value = phi_ext_common::json::to_value(RtkIntegrationConfig::default()).expect("序列化应成功");
         assert!(value.get("guardWhenRtkMissing").is_some());
         assert!(value.get("outputCompaction").is_some());
         assert!(value["outputCompaction"].get("stripAnsi").is_some());

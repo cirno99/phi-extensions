@@ -127,7 +127,7 @@ impl Runtime {
     pub fn compact(
         &mut self,
         tool_name: &str,
-        input: &serde_json::Value,
+        input: &phi_ext_common::json::Value,
         content: &str,
     ) -> CompactionOutcome {
         let Runtime {

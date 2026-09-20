@@ -2,12 +2,15 @@
 //!
 //! 所有扩展的配置都放在 `<phi_home>/extensions/<name>/config.json`。
 //! 写入采用「临时文件 + rename」的原子方式，避免进程被杀时留下半个文件。
+//! 编解码统一走 simd-json（与 `crate::json` 同一实现），不再依赖 serde_json。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+
+use crate::json::{Value, ValueAsScalar, ValueObjectAccess};
 
 /// 配置读写错误。
 #[derive(Debug, thiserror::Error)]
@@ -23,13 +26,25 @@ pub enum ConfigError {
     },
     /// JSON 序列化失败。
     #[error("配置序列化失败：{0}")]
-    Serialize(#[from] serde_json::Error),
+    Serialize(#[from] simd_json::Error),
     /// 目标路径没有父目录，无法创建目录。
     #[error("配置路径没有父目录：{path}")]
     NoParent {
         /// 出错的路径。
         path: PathBuf,
     },
+}
+
+impl From<crate::json::SerializeError> for ConfigError {
+    fn from(err: crate::json::SerializeError) -> Self {
+        ConfigError::Serialize(err.0)
+    }
+}
+
+/// 用 simd-json 反序列化（内部复制一份再原地解析）。
+fn parse<T: DeserializeOwned>(raw: &str) -> Result<T, simd_json::Error> {
+    let mut bytes = raw.as_bytes().to_vec();
+    simd_json::serde::from_slice(&mut bytes)
 }
 
 /// 读取 JSON 配置。
@@ -46,7 +61,7 @@ where
     if raw.trim().is_empty() {
         return T::default();
     }
-    serde_json::from_str(&raw).unwrap_or_default()
+    parse(&raw).unwrap_or_default()
 }
 
 /// 读取 JSON 配置；文件存在但解析失败时返回 `Err`。
@@ -70,7 +85,7 @@ where
     if raw.trim().is_empty() {
         return Ok(None);
     }
-    Ok(Some(serde_json::from_str(&raw)?))
+    Ok(Some(parse(&raw)?))
 }
 
 /// 原子写入 JSON 配置。
@@ -89,7 +104,7 @@ where
         source,
     })?;
 
-    let body = serde_json::to_string_pretty(value)?;
+    let body = simd_json::serde::to_string_pretty(value)?;
     let tmp = temp_path(path);
     fs::write(&tmp, body).map_err(|source| ConfigError::Io {
         path: tmp.clone(),
@@ -108,37 +123,53 @@ fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// 从可选的父对象里取子字段（父缺失时返回 `None`）。
+///
+/// 归一化函数里大量出现「父级可选、再取子字段」的写法，此辅助函数避免把
+/// `Value::Null` 之类的占位值四处传递。
+pub fn child<'a>(parent: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    parent.and_then(|value| value.get(key))
+}
+
 /// 宽松布尔解析：接受 `true/false`、`1/0`、`yes/no`、`on/off`（大小写不敏感）。
 ///
 /// 无法识别时返回 `fallback`。用于兼容手写配置文件里的各种写法。
-pub fn to_bool(value: &serde_json::Value, fallback: bool) -> bool {
-    match value {
-        serde_json::Value::Bool(b) => *b,
-        serde_json::Value::Number(n) => n.as_i64().map(|i| i != 0).unwrap_or(fallback),
-        serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+pub fn to_bool(value: Option<&Value>, fallback: bool) -> bool {
+    let Some(value) = value else {
+        return fallback;
+    };
+    if let Some(flag) = value.as_bool() {
+        return flag;
+    }
+    if let Some(number) = value.as_i64() {
+        return number != 0;
+    }
+    if let Some(text) = value.as_str() {
+        return match text.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => true,
             "false" | "0" | "no" | "off" => false,
             _ => fallback,
-        },
-        _ => fallback,
+        };
     }
+    fallback
 }
 
 /// 整数解析并夹紧到 `[min, max]`。
 ///
 /// 浮点数会被截断为整数。无法解析时返回 `fallback`（同样会被夹紧）。
-pub fn to_int(value: &serde_json::Value, min: i64, max: i64, fallback: i64) -> i64 {
-    let parsed = match value {
-        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
-        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
-        _ => None,
-    };
+pub fn to_int(value: Option<&Value>, min: i64, max: i64, fallback: i64) -> i64 {
+    let parsed = value.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|number| number as i64))
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse::<i64>().ok()))
+    });
     parsed.unwrap_or(fallback).clamp(min, max)
 }
 
 /// 字符串枚举解析：大小写不敏感地匹配候选值，未命中时返回 `fallback`。
-pub fn to_enum<T: Copy>(value: &serde_json::Value, candidates: &[(&str, T)], fallback: T) -> T {
-    let Some(raw) = value.as_str() else {
+pub fn to_enum<T: Copy>(value: Option<&Value>, candidates: &[(&str, T)], fallback: T) -> T {
+    let Some(raw) = value.and_then(|value| value.as_str()) else {
         return fallback;
     };
     let lowered = raw.trim().to_ascii_lowercase();
@@ -152,6 +183,7 @@ pub fn to_enum<T: Copy>(value: &serde_json::Value, candidates: &[(&str, T)], fal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json::json;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,27 +258,27 @@ mod tests {
 
     #[test]
     fn to_bool_should_accept_common_spellings() {
-        assert!(to_bool(&serde_json::json!(true), false));
-        assert!(to_bool(&serde_json::json!("YES"), false));
-        assert!(to_bool(&serde_json::json!(1), false));
-        assert!(!to_bool(&serde_json::json!("off"), true));
-        assert!(!to_bool(&serde_json::json!(0), true));
-        assert!(to_bool(&serde_json::json!("maybe"), true));
-        assert!(!to_bool(&serde_json::Value::Null, false));
+        assert!(to_bool(Some(&json!(true)), false));
+        assert!(to_bool(Some(&json!("YES")), false));
+        assert!(to_bool(Some(&json!(1)), false));
+        assert!(!to_bool(Some(&json!("off")), true));
+        assert!(!to_bool(Some(&json!(0)), true));
+        assert!(to_bool(Some(&json!("maybe")), true));
+        assert!(!to_bool(None, false));
     }
 
     #[test]
     fn to_int_should_clamp_to_range() {
-        assert_eq!(to_int(&serde_json::json!(5000), 1000, 200_000, 12_000), 5000);
-        assert_eq!(to_int(&serde_json::json!(10), 1000, 200_000, 12_000), 1000);
-        assert_eq!(to_int(&serde_json::json!(999_999), 1000, 200_000, 12_000), 200_000);
+        assert_eq!(to_int(Some(&json!(5000)), 1000, 200_000, 12_000), 5000);
+        assert_eq!(to_int(Some(&json!(10)), 1000, 200_000, 12_000), 1000);
+        assert_eq!(to_int(Some(&json!(999_999)), 1000, 200_000, 12_000), 200_000);
     }
 
     #[test]
     fn to_int_should_fallback_and_clamp_on_bad_input() {
-        assert_eq!(to_int(&serde_json::json!("abc"), 1000, 200_000, 50), 1000);
-        assert_eq!(to_int(&serde_json::json!("4200"), 1000, 200_000, 50), 4200);
-        assert_eq!(to_int(&serde_json::json!(3.9), 0, 100, 0), 3);
+        assert_eq!(to_int(Some(&json!("abc")), 1000, 200_000, 50), 1000);
+        assert_eq!(to_int(Some(&json!("4200")), 1000, 200_000, 50), 4200);
+        assert_eq!(to_int(Some(&json!(3.9)), 0, 100, 0), 3);
     }
 
     #[test]
@@ -257,9 +289,9 @@ mod tests {
             Suggest,
         }
         let candidates = [("rewrite", Mode::Rewrite), ("suggest", Mode::Suggest)];
-        assert_eq!(to_enum(&serde_json::json!("Rewrite"), &candidates, Mode::Suggest), Mode::Rewrite);
-        assert_eq!(to_enum(&serde_json::json!(" SUGGEST "), &candidates, Mode::Rewrite), Mode::Suggest);
-        assert_eq!(to_enum(&serde_json::json!("other"), &candidates, Mode::Rewrite), Mode::Rewrite);
-        assert_eq!(to_enum(&serde_json::json!(7), &candidates, Mode::Rewrite), Mode::Rewrite);
+        assert_eq!(to_enum(Some(&json!("Rewrite")), &candidates, Mode::Suggest), Mode::Rewrite);
+        assert_eq!(to_enum(Some(&json!(" SUGGEST ")), &candidates, Mode::Rewrite), Mode::Suggest);
+        assert_eq!(to_enum(Some(&json!("other")), &candidates, Mode::Rewrite), Mode::Rewrite);
+        assert_eq!(to_enum(Some(&json!(7)), &candidates, Mode::Rewrite), Mode::Rewrite);
     }
 }

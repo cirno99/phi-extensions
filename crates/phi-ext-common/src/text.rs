@@ -82,8 +82,15 @@ pub fn line_count(input: &str) -> usize {
 }
 
 /// 文本字符数。
+///
+/// 纯 ASCII 走字节数快路径（`str::is_ascii` 按机器字 / SIMD 扫描），
+/// 避免 `chars().count()` 对绝大多数构建 / 日志输出的全量 UTF-8 解码。
 pub fn char_count(input: &str) -> usize {
-    input.chars().count()
+    if input.is_ascii() {
+        input.len()
+    } else {
+        input.chars().count()
+    }
 }
 
 /// 判断一行是否是 `LINE:HASH` 锚点行（例如 `12:9f3ac1|code` 或 `12:9f3ac1`）。
@@ -102,8 +109,12 @@ pub fn is_anchor_line(line: &str) -> bool {
         return false;
     }
     let rest = &rest[1..];
-    let hash: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-    hash.len() >= 4
+    // 只取长度，无需为十六进制前缀分配一个 String。
+    let hash_len = rest
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .count();
+    hash_len >= 4
 }
 
 /// 以人类可读形式格式化 token 数：`1.2B` / `3.4M` / `12K` / `999`。

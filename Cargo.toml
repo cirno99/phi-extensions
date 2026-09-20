@@ -19,7 +19,6 @@ repository = "https://github.com/pulseaiclub/phi"
 [workspace.dependencies]
 phi-ext = { git = "https://github.com/pulseaiclub/phi", branch = "main" }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 # 正则：rtk 输出压缩与命令检测需要大量模式匹配，与 pi 版保持一致
 regex = "1"

@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use phi_ext_common::json::{Value, ValueObjectAccess};
 
 use phi_ext_common::config::{load_strict, save_atomic, to_bool, to_enum, ConfigError};
 use phi_ext_common::paths;
@@ -62,9 +62,9 @@ impl Default for CacheOptimizerConfig {
 pub fn normalize(raw: &Value) -> CacheOptimizerConfig {
     let defaults = CacheOptimizerConfig::default();
     CacheOptimizerConfig {
-        enabled: to_bool(raw.get("enabled").unwrap_or(&Value::Null), defaults.enabled),
+        enabled: to_bool(raw.get("enabled"), defaults.enabled),
         footer_mode: to_enum(
-            raw.get("footerMode").unwrap_or(&Value::Null),
+            raw.get("footerMode"),
             &[
                 ("session", FooterMode::Session),
                 ("total", FooterMode::Total),
@@ -73,7 +73,7 @@ pub fn normalize(raw: &Value) -> CacheOptimizerConfig {
             defaults.footer_mode,
         ),
         prompt_cache_key: to_enum(
-            raw.get("promptCacheKey").unwrap_or(&Value::Null),
+            raw.get("promptCacheKey"),
             &[
                 ("auto", PromptCacheKeyMode::Auto),
                 ("omit", PromptCacheKeyMode::Omit),
@@ -102,14 +102,14 @@ pub fn load(path: &Path) -> (CacheOptimizerConfig, Option<String>) {
 
 /// 原子保存配置。
 pub fn save(config: &CacheOptimizerConfig, path: &Path) -> Result<(), ConfigError> {
-    let normalized = normalize(&serde_json::to_value(config)?);
+    let normalized = normalize(&phi_ext_common::json::to_value(config)?);
     save_atomic(path, &normalized)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use phi_ext_common::json::json;
 
     #[test]
     fn defaults_should_match_pi_intent() {

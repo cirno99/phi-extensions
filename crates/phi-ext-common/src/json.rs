@@ -15,11 +15,17 @@
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-// `Value::get` 由该 trait 提供，必须显式引入。
-use simd_json::prelude::{ValueAsScalar as _, ValueObjectAccess as _};
 
 /// 拥有所有权的 JSON 值。
 pub type Value = simd_json::OwnedValue;
+
+/// simd-json 的 `json!` 宏，供扩展直接构造 JSON 值。
+pub use simd_json::json;
+/// 标量 / 数组 / 对象读取与可变对象访问所需的一整套 trait。
+pub use simd_json::prelude::{
+    MutableObject, ObjectMut, ValueAsArray, ValueAsMutObject, ValueAsObject, ValueAsScalar,
+    ValueObjectAccess, Writable,
+};
 
 /// 借用输入的 JSON 值（零拷贝读取字符串与数组）。
 pub type Borrowed<'a> = simd_json::BorrowedValue<'a>;
@@ -82,6 +88,16 @@ pub fn to_string<T: Serialize>(value: &T) -> Result<String, SerializeError> {
 /// 序列化为带缩进的 JSON（配置文件人工可读）。
 pub fn to_string_pretty<T: Serialize>(value: &T) -> Result<String, SerializeError> {
     simd_json::to_string_pretty(value).map_err(SerializeError)
+}
+
+/// 序列化为字节（工具 schema 等需要 `Vec<u8>` 的场景）。
+pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, SerializeError> {
+    simd_json::to_vec(value).map_err(SerializeError)
+}
+
+/// 把实现了 `Serialize` 的值转换为通用 JSON 值。
+pub fn to_value<T: Serialize>(value: T) -> Result<Value, SerializeError> {
+    simd_json::serde::to_owned_value(value).map_err(SerializeError)
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::prompts::{RULES_POINTER, TIER2_DIRECTIVE, TIER3_DIRECTIVE};
 use crate::prune::SUMMARY_HEADER;
 use crate::state::active_blocks;
 use crate::tokenize::count_message_tokens;
@@ -340,6 +341,11 @@ pub fn decide_nudge(input: NudgeInput<'_>) -> NudgeDecision {
         pending_t3: t3_pen,
         max_pending,
         min_pressure_benefit,
+        // 首次提醒判定：状态里没有任何已展示记录，且“待展示基线”也为空。
+        first_by_tier: injected_tier.filter(|t| {
+            state.nudge.last_nudge_shown_tokens == 0
+                && state.nudge.last_shown_by_tier.get(t).copied().unwrap_or(0) == 0
+        }),
     };
 
     let (compressible_ranges, protected_ranges) = match input.recommendation {
@@ -438,6 +444,108 @@ pub fn format_ranges(compressible: &[CompressibleRange], protected: &[ProtectedR
     )
 }
 
+/// 渲染提醒的**精炼**正文。
+///
+/// # 为什么不是完整规则
+///
+/// phi 的 `turn_stopping` 转向消息被当作 user 消息 append 进会话历史并永久留在
+/// 那里（`internal/agent/engine.go` 的 `session.Append(llm.Message{Role: RoleUser, ...})`）。
+/// 历史版本每次都把 `HOW TO COMPRESS` 全文（~744 token）塞进去，于是每发一次提醒
+/// 就永久 +~800 token，而压缩本身在 phi 上省不了对应量——净亏。
+///
+/// 现在注入的是一条紧凑指令 + 范围列表；完整规则要点由每轮契约
+/// （[`crate::prompts::COMPRESS_CONTRACT`]）覆盖。
+///
+/// 例外：**T2/T3 蒸馏规则**在会话首次该层级提醒时携带（蒸馏该保什么、丢什么，
+/// 契约里没说），靠 [`is_first_tier_nudge`] 判定。
+fn tier_rules_body(tier: u8, prompts: &crate::prompts::Prompts, first_time: bool) -> String {
+    if first_time {
+        return if tier == 2 {
+            prompts.tier2_body()
+        } else {
+            prompts.tier3_body()
+        };
+    }
+    let directive = if tier == 2 {
+        TIER2_DIRECTIVE
+    } else {
+        TIER3_DIRECTIVE
+    };
+    format!("{directive}\n\n{RULES_POINTER}")
+}
+
+/// 是否为本会话首次就该层级发出提醒。
+pub fn is_first_tier_nudge(decision: &NudgeDecision) -> bool {
+    match decision.tier {
+        Some(tier) => decision.breakdown.first_by_tier == Some(tier),
+        None => false,
+    }
+}
+
+fn format_block_map(spans: &[BlockSpan]) -> String {
+    if spans.is_empty() {
+        return String::new();
+    }
+    const MAX_SHOWN: usize = 8;
+    let hidden = spans.len().saturating_sub(MAX_SHOWN);
+    let shown = if hidden > 0 {
+        &spans[spans.len() - MAX_SHOWN..]
+    } else {
+        spans
+    };
+    let items: Vec<String> = shown
+        .iter()
+        .map(|s| {
+            if s.tier > 1 {
+                format!("{}= {}–{} t{}", s.block_id, s.start_ref, s.end_ref, s.tier)
+            } else {
+                format!("{}= {}–{}", s.block_id, s.start_ref, s.end_ref)
+            }
+        })
+        .collect();
+    let prefix = if hidden > 0 {
+        format!("…+{hidden} older · ")
+    } else {
+        String::new()
+    };
+    format!(
+        "Active blocks ({}): {prefix}{}",
+        spans.len(),
+        items.join(" · ")
+    )
+}
+
+fn format_tier_targets(tier: u8, blocks: &[CompressionBlock]) -> String {
+    if blocks.is_empty() {
+        return "Target blocks: (none found)".to_string();
+    }
+    let lines: Vec<String> = blocks
+        .iter()
+        .map(|b| {
+            let summary_tokens = crate::tokenize::count_tokens(&b.summary);
+            let topic = b
+                .topic
+                .as_ref()
+                .map(|t| format!("  \"{t}\""))
+                .unwrap_or_default();
+            format!(
+                "  {}  {} msgs  {}→{}{}",
+                b.block_id,
+                b.effective_message_ids.len(),
+                format_k(b.compressed_tokens),
+                format_k(summary_tokens),
+                topic
+            )
+        })
+        .collect();
+    let label = if tier == 2 { "tier-1" } else { "tier-2" };
+    format!(
+        "Target {label} blocks to distill ({}):\n{}",
+        blocks.len(),
+        lines.join("\n")
+    )
+}
+
 /// 渲染提醒文本。
 pub fn render_nudge_text(
     decision: &NudgeDecision,
@@ -446,28 +554,36 @@ pub fn render_nudge_text(
 ) -> String {
     let breakdown_str = context_breakdown.map(format_breakdown).unwrap_or_default();
     let ranges_str = format_ranges(&decision.compressible_ranges, &decision.protected_ranges);
+    let block_map_str = format_block_map(&decision.active_block_spans);
     let is_emergency =
         decision.breakdown.emergency_override > 0 || decision.breakdown.over_limit > 0;
+    // 提醒只写一次（首次该层级），之后只发指令：规则文本会永久留在会话历史里。
+    let first_time = is_first_tier_nudge(decision);
 
     let mut parts: Vec<String> = Vec::new();
     if let Some(tier) = decision.tier {
         if tier >= 2 {
             let is_t2 = tier == 2;
             let head = if is_emergency {
-                format!(
-                    "⚠️ Context limit reached — compress now. Prioritize consumed tool outputs.\n\n{}",
-                    prompts.compress_philosophy
-                )
+                "⚠️ Context limit reached — distill NOW into a denser summary to reclaim tokens."
+                    .to_string()
             } else {
-                format!(
-                    "This is an efficiency nudge to compress early and keep context lean — not an overflow warning.\n\n{}",
-                    prompts.compress_philosophy
-                )
+                "This is an efficiency nudge to compress early and keep context lean — not an overflow warning."
+                    .to_string()
             };
             parts.push(head);
             parts.push(String::new());
             parts.push(breakdown_str);
             parts.push(String::new());
+            let targets = &decision.tier_target_blocks;
+            let start_id = targets
+                .first()
+                .map(|b| b.block_id.clone())
+                .unwrap_or_else(|| "b1".to_string());
+            let end_id = targets
+                .last()
+                .map(|b| b.block_id.clone())
+                .unwrap_or_else(|| "b5".to_string());
             parts.push(if is_emergency {
                 format!(
                     "[EMERGENCY — TIER {tier} {}] Context limit reached — distill NOW.",
@@ -487,43 +603,54 @@ pub fn render_nudge_text(
                     }
                 )
             });
-            parts.push(if is_t2 {
-                prompts.tier2_distill_rules.clone()
-            } else {
-                prompts.tier3_condense_rules.clone()
-            });
-            parts.push(prompts.how_to_compress_rules.clone());
+            parts.push(tier_rules_body(tier, prompts, first_time));
+            parts.push(format_tier_targets(tier, targets));
+            parts.push(format!(
+                "Example: compress({{ content: [{{ startId: \"{start_id}\", endId: \"{end_id}\", summary: \"...\" }}] }})"
+            ));
             return compact(parts).join("\n");
         }
     }
 
     if is_emergency {
-        parts.push(format!(
-            "⚠️ Context limit reached — compress now. Prioritize consumed tool outputs.\n\n{}",
-            prompts.compress_philosophy
-        ));
+        parts.push(
+            "⚠️ Context limit reached — compress now. Prioritize consumed tool outputs."
+                .to_string(),
+        );
         parts.push(String::new());
         parts.push(breakdown_str);
         parts.push(String::new());
-        parts.push(prompts.how_to_compress_rules.clone());
-        parts.push(String::new());
         parts.push(ranges_str);
+        if !block_map_str.is_empty() {
+            parts.push(String::new());
+            parts.push(block_map_str);
+        }
+        parts.push(String::new());
+        parts.push(
+            "{ \"topic\": \"...\", \"content\": [{ \"startId\": \"<ID>\", \"endId\": \"<ID>\", \"summary\": \"...\" }] }"
+                .to_string(),
+        );
+        parts.push(
+            "Only use IDs from visible messages above. Compress older work first.".to_string(),
+        );
         return compact(parts).join("\n");
     }
 
-    parts.push(format!(
-        "This is an efficiency nudge to compress early and keep context lean — not an overflow warning. A separate, stronger alert will appear if the context is actually full.\n\n{}",
-        prompts.compress_philosophy
-    ));
+    parts.push(
+        "This is an efficiency nudge to compress early and keep context lean — not an overflow warning. A separate, stronger alert will appear if the context is actually full."
+            .to_string(),
+    );
     parts.push(String::new());
     parts.push(breakdown_str);
     parts.push(String::new());
-    parts.push(prompts.how_to_compress_rules.clone());
-    parts.push(String::new());
     parts.push(ranges_str);
+    if !block_map_str.is_empty() {
+        parts.push(String::new());
+        parts.push(block_map_str);
+    }
     parts.push(String::new());
     parts.push(
-        "💡 Compress all ranges in one call (pass multiple content entries: `content: [{...}, {...}]`)."
+        "💡 Compress all ranges in one call (pass multiple content entries: `content: [{...}, {...}]`). Rules: ACP CONTEXT COMPRESSION (above)."
             .to_string(),
     );
     compact(parts).join("\n")
@@ -539,13 +666,12 @@ pub fn render_manual_compress_text(
 ) -> String {
     let ranges_str = format_ranges(&decision.compressible_ranges, &decision.protected_ranges);
     let parts: Vec<String> = vec![
-        "[MANUAL COMPRESS] The user requested compression explicitly. Follow the rules below \
-         and call the `compress` tool now in a single call."
+        "[MANUAL COMPRESS] The user requested compression explicitly. Call the `compress` tool now in a single call."
             .to_string(),
         String::new(),
         prompts.compress_philosophy.clone(),
         String::new(),
-        prompts.how_to_compress_rules.clone(),
+        RULES_POINTER.to_string(),
         String::new(),
         ranges_str,
         String::new(),
@@ -642,7 +768,42 @@ mod tests {
         let text = render_manual_compress_text(&decision, &crate::prompts::Prompts::default());
         assert!(text.starts_with("[MANUAL COMPRESS]"));
         assert!(text.contains("m00001"));
-        assert!(text.contains("HOW TO COMPRESS"));
+        assert!(text.contains("Rules:"));
+    }
+
+    /// 提醒文本会永久留在会话历史里，必须保持精简。
+    #[test]
+    fn nudge_text_should_stay_small() {
+        let decision = NudgeDecision {
+            should_inject: true,
+            compressible_ranges: vec![CompressibleRange {
+                start_ref: "m00001".into(),
+                end_ref: "m00010".into(),
+                count: 10,
+                tokens: 1_234,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let text = render_nudge_text(&decision, &crate::prompts::Prompts::default(), None);
+        let tokens = crate::tokenize::count_tokens(&text);
+        assert!(tokens < 200, "普通提醒过大：{tokens} tokens\n{text}");
+        assert!(!text.contains("HOW TO COMPRESS"));
+    }
+
+    /// 首次 tier 提醒才带完整蒸馏规则，后续只带指令。
+    #[test]
+    fn tier_rules_should_only_be_full_on_first_nudge() {
+        let prompts = crate::prompts::Prompts::default();
+        let first = tier_rules_body(2, &prompts, true);
+        let later = tier_rules_body(2, &prompts, false);
+        assert!(first.contains("KEEP — these are the only things"));
+        assert!(!later.contains("KEEP — these are the only things"));
+        assert!(
+            crate::tokenize::count_tokens(&later) < crate::tokenize::count_tokens(&first) / 2,
+            "后续提醒应明显更短"
+        );
+        assert!(tier_rules_body(3, &prompts, true).contains("ULTRA-CONDENSATION"));
     }
 
     #[test]

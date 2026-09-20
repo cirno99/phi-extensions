@@ -70,14 +70,30 @@ scripts/install.sh --debug  # 构建 debug
 |---|---|
 | `compress` 工具 | 模型写摘要压缩一个 ref 区间；返回新建块账本（`bN=mAAAAA–mBBBBB`） |
 | `acp_decompress` / `acp_search` | 恢复被压缩内容 / 按相关度检索块 |
-| `acp_status` | 使用率、块统计与当前可压缩范围 |
+| `acp_status` | 使用率、块统计（含 absorbed）与当前可压缩范围 |
 | `acp_rule` | 记录永不压缩、每轮重注入的持久规则 |
 | `/acp status\|compress\|enable\|disable\|config …\|rules\|reset\|help` | 状态面板、手动压缩与配置 |
 
-`before_agent_start` 注入压缩哲学与持久规则；`turn_stopping` 按增长量发提醒
-（带连续上限防死循环）；`user_input` / `tool_call` / `tool_result` 维护本扩展
-自己的消息观测视图。配置：`~/.phi/extensions/phi-acp/config.json`，
+`before_agent_start` 每会话**只注入一次**精炼压缩契约（+ 持久规则）；`turn_stopping`
+按增长量发提醒（带连续上限防死循环）；`user_input` / `tool_call` / `tool_result` 维护
+本扩展自己的消息观测视图。配置：`~/.phi/extensions/phi-acp/config.json`，
 状态：`~/.phi/extensions/phi-acp/state/state.json`。
+
+**在 phi 上什么真正省 token**：`tool_result` 拦截里把巨型工具输出换成「头 + 尾 +
+`[acp absorb]` 标记」并回写（`absorbEnabled`，默认开）——这是宿主上唯一能把内容从
+上游请求里**真正去掉**的通道（与 rtk 同路）。`compress` 产生的块摘要做不到这一点：
+phi 没有消息历史 / 请求体重写钩子，摘要只落在扩展自己的 `state.json` 里，用于给模型
+提供 ref 索引与可检索的块账本。因此：
+
+- 需要控制上下文大小 → 调 `absorb*`（`absorb-min-tokens` / `absorb-keep-prefix` /
+  `absorb-keep-suffix` / `absorb-threshold-pct` / `absorb-exclude-tools`）。
+- 需要写摘要时 → `compress` 仍然有价值（模型可 `acp_search` / `acp_decompress`）。
+
+**注入成本**：phi 会把 `SystemPromptAppend` 拼到**用户消息**后面并永久留在会话历史里
+（`ext/go/types.go`："appended to the user message"），`turn_stopping` 的转向消息同样
+被当作 user 消息 append。因此每轮注入的文本永远无法被压缩回收：契约改成每会话一次
+（~180 token），提醒里的完整规则改成只在首次该层级携带。历史版本每轮注入 ~1.5K token
+（四段提示词全文），比它压掉的还多。
 
 **压缩频率调优**：扩展层对内核提醒阈值做了更积极的覆盖（可用 `/acp config` 调整）——
 `growth-tokens=20000` / `min-growth-tokens=10000` / `min-context-pct=0.30` /
@@ -87,7 +103,7 @@ scripts/install.sh --debug  # 构建 debug
 **与 pi 版的差异**：billion-context 在 pi 里是一个改基地址 + 改 `fetch` 的 HTTP
 代理（`before_provider_request` 重写请求体）。phi **没有请求体钩子、也拿不到
 消息历史**，因此代理层无法落地；本扩展保留内核与插件交互面，在自身观测到的
-消息视图上运行内核。详见 [PLAN.md](PLAN.md)。
+消息视图上运行内核，并用 `tool_result` 回写兑现真实收益（见上）。
 
 ### deepseek-enhanced
 
@@ -186,13 +202,35 @@ rtk 原先自带的 ANSI 正则实现漏剥带私有参数的 CSI 序列：
 
 **单纯减少堆分配并没有带来明显提速**（复用竞技场与每次新建竞技场的耗时几乎相同，
 40.96 ms vs 42.56 ms）——因为瓶颈在正则，不在分配器。真正有效的是去掉逐行正则。
-因此剩余的优化空间集中在：`strip_ansi`（约 51 µs/次，已是单遍扫描）、
-以及 `test_output` 的失败块匹配（失败时逐行跑 7 条正则，尚未做首字节派发）。
+因此剩余的优化空间集中在：`strip_ansi`（约 51 µs/次，已是单遍扫描）。
+`test_output` 的失败块匹配已按首字节派发（`is_failure_start`），普通行不再触发正则。
+
+### 第二轮优化（行为不变）
+
+- **acp 去掉每 turn 的多余深拷贝**：`runtime.rs` 的 `process()` 不再 `outcome.state.clone()`，
+  直接 `std::mem::take` 移入运行时；`compress.rs` 的 `hide_consumed_compress_calls` 在无消费
+  调用时原样返回消息视图，不再 `messages.to_vec()`。
+- **acp 会话 token 增量读取**：`session_tokens.rs` 记住上次文件偏移，只读自上次以来新增的
+  字节（会话文件只追加），把每 turn 的读盘量从 512KB 尾部降到本 turn 追加量。
+- **rtk 字符数只算一次**：`compact_tool_result` 算好的 `original_chars` / `compacted_chars`
+  透传给 `OutputMetrics::track`，不再重复全量扫描；统计记录加上限（`MAX_RECORDS = 1000`，
+  按插入顺序淘汰）避免长驻进程内存只增不减。
+- **`apply_truncation` 字节预筛**：字节数是字符数上界，未超上限时跳过字符计数。
+- **`phi-ext-common::text` 快路径**：`char_count` 对纯 ASCII 直接返回字节数；`is_anchor_line`
+  不再为十六进制前缀分配 `String`。
+- **去重**：`project_dir_name` 由 acp / cache-optimizer 各一份收敛到 `phi-ext-common::paths`。
+- **JSON 库统一**：全面改用 simd-json，移除 `serde_json` 依赖。`serde_json` 仅在
+  `simd-json` 内部作为可选 bench 依赖保留；workspace 与各扩展的直接依赖已删除。
+  `phi-ext-common::config` 的宽松解析（`to_bool` / `to_int` / `to_enum`）改为收
+  `Option<&Value>`，并新增 `child(parent, key)` 辅助（替代 `Value::Null` 占位）；
+  `phi-ext-common::json` 重导出 `json!` 宏与所需 trait，并提供 `to_vec` / `to_value`。
+  acp 的 `tools.rs` schema 构造、sleep-continue 的 `write_stable`、deepseek 的
+  `str_replace_editor` 入参解析等也都改走 `phi_ext_common::json`。
 
 ## 开发
 
 ```bash
-cargo test --workspace     # 363 个测试（含 5 个 PXB 生命周期端到端冒烟测试）
+cargo test --workspace     # 380 个测试（含 5 个 PXB 生命周期端到端冒烟测试）
 cargo build --release      # 构建全部扩展
 cargo clippy --workspace --all-targets   # 静态检查（当前零告警）
 ```

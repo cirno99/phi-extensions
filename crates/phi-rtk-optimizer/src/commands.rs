@@ -104,7 +104,7 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
 
 /// 渲染 `show` 的输出。
 fn render_show(guard: &crate::runtime::Runtime) -> String {
-    let config_json = serde_json::to_string_pretty(&guard.config)
+    let config_json = phi_ext_common::json::to_string_pretty(&guard.config)
         .unwrap_or_else(|err| format!("<配置序列化失败：{err}>"));
     let metrics = guard.metrics.summary();
     format!(

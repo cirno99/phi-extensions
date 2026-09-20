@@ -11,7 +11,7 @@ const USAGE: &str = "📋 /acp 子命令：\n\
   status                       — 上下文使用率、块统计与可压缩范围（默认）\n\
   compress                     — 立即压缩当前可压缩范围（交由模型调用 compress 工具）\n\
   enable | disable             — 开关扩展\n\
-  config <key> <value>         — 设置配置（context-limit / render-tags / min-compress / host-tokens / growth-tokens / min-growth-tokens / min-context-pct / max-context-pct / tier2-trigger / tier3-trigger）\n\
+  config <key> <value>         — 设置配置（context-limit / render-tags / min-compress / host-tokens / growth-tokens / min-growth-tokens / min-context-pct / max-context-pct / tier2-trigger / tier3-trigger / absorb / absorb-min-tokens / absorb-keep-prefix / absorb-keep-suffix / absorb-threshold-pct）\n\
   rules                        — 列出持久规则\n\
   reset                        — 清空当前会话观测视图与压缩状态（需确认）\n\
   help                         — 显示本说明";
@@ -21,6 +21,10 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
     ext.register_command(
         "acp",
         phi::Command::new("ACP 上下文压缩状态与配置", move |args, ctx| {
+            // 命令处理器是 SDK 唯一能拿到宿主 cwd 的地方，回填给 `session_tokens`
+            // 用于精确定位当前项目的会话 JSONL（避免读到别的项目的 usage）。
+            crate::session_tokens::set_host_cwd(ctx.cwd());
+
             let tokens: Vec<&str> = args.split_whitespace().collect();
             let subcommand = tokens.first().copied().unwrap_or("status");
 
@@ -50,7 +54,8 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                                 )
                             })
                             .unwrap_or_default();
-                        (report, ranges)
+                        let absorbed = guard.state.stats.absorbed_tokens;
+                        (report, ranges, absorbed)
                     };
                     ctx.notify(
                         "info",
@@ -143,6 +148,41 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                                 Ok(v) => guard.config.use_host_tokens = v,
                                 Err(_) => {
                                     ctx.notify("error", "host-tokens 需要 true/false");
+                                    return Ok(());
+                                }
+                            },
+                            "absorb" => match value.parse::<bool>() {
+                                Ok(v) => guard.config.absorb_enabled = v,
+                                Err(_) => {
+                                    ctx.notify("error", "absorb 需要 true/false");
+                                    return Ok(());
+                                }
+                            },
+                            "absorb-min-tokens" => match value.parse::<u64>() {
+                                Ok(v) => guard.config.absorb_min_tool_tokens = v,
+                                Err(_) => {
+                                    ctx.notify("error", "absorb-min-tokens 需要整数");
+                                    return Ok(());
+                                }
+                            },
+                            "absorb-keep-prefix" => match value.parse::<usize>() {
+                                Ok(v) => guard.config.absorb_keep_prefix_chars = v,
+                                Err(_) => {
+                                    ctx.notify("error", "absorb-keep-prefix 需要整数");
+                                    return Ok(());
+                                }
+                            },
+                            "absorb-keep-suffix" => match value.parse::<usize>() {
+                                Ok(v) => guard.config.absorb_keep_suffix_chars = v,
+                                Err(_) => {
+                                    ctx.notify("error", "absorb-keep-suffix 需要整数");
+                                    return Ok(());
+                                }
+                            },
+                            "absorb-threshold-pct" => match value.parse::<f64>() {
+                                Ok(v) => guard.config.absorb_context_threshold_pct = v,
+                                Err(_) => {
+                                    ctx.notify("error", "absorb-threshold-pct 需要小数（如 0.5）");
                                     return Ok(());
                                 }
                             },

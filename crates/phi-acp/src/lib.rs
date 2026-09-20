@@ -12,7 +12,7 @@
 //! [`boundaries`] · [`prune`] · [`block_map`] · [`recommend`] · [`nudge`] ·
 //! [`truncate`] · [`decompress`] · [`render`] · [`prompts`] · [`compress`]。
 //!
-//! 扩展外壳：[`runtime`] · [`tools`] · [`commands`]。
+//! 扩展外壳：[`runtime`] · [`tools`] · [`commands`] · [`absorb`]。
 //!
 //! # 与 phi 宿主能力的取舍
 //!
@@ -22,6 +22,7 @@
 //! 输入 + 工具调用/结果），在其上运行内核；压缩产生的块摘要通过系统提示词注入
 //! 与工具输出回写体现。详见 README。
 
+pub mod absorb;
 pub mod block_map;
 pub mod boundaries;
 pub mod commands;

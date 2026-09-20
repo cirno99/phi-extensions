@@ -73,7 +73,7 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
 }
 
 fn register_compress(ext: &mut phi::Extension, shared: Shared) {
-    let schema = serde_json::json!({
+    let schema = phi_ext_common::json::json!({
         "type": "object",
         "properties": {
             "topic": { "type": "string", "description": "Short topic label for the compressed range." },
@@ -98,7 +98,7 @@ fn register_compress(ext: &mut phi::Extension, shared: Shared) {
         "compress",
         "Compress a range of the conversation into a self-contained summary. \
          The summary becomes the only record of the replaced messages — make it complete.",
-        phi::Schema::raw(serde_json::to_vec(&schema).expect("schema")),
+        phi::Schema::raw(phi_ext_common::json::to_vec(&schema).expect("schema")),
         move |args| {
             let parsed: CompressArgs = parse_args(args)?;
             let mut all = parsed.content;
@@ -154,7 +154,7 @@ fn register_compress(ext: &mut phi::Extension, shared: Shared) {
 }
 
 fn register_decompress(ext: &mut phi::Extension, shared: Shared) {
-    let schema = serde_json::json!({
+    let schema = phi_ext_common::json::json!({
         "type": "object",
         "properties": {
             "blockId": { "type": "string", "description": "Block id, e.g. b3" }
@@ -165,7 +165,7 @@ fn register_decompress(ext: &mut phi::Extension, shared: Shared) {
         "acp_decompress",
         "Restore the original content of a compressed block and mark it expanded \
          (it will not be re-folded).",
-        phi::Schema::raw(serde_json::to_vec(&schema).expect("schema")),
+        phi::Schema::raw(phi_ext_common::json::to_vec(&schema).expect("schema")),
         move |args| {
             let parsed: DecompressArgs = parse_args(args)?;
             let mut guard = shared.borrow_mut();
@@ -190,7 +190,7 @@ fn register_decompress(ext: &mut phi::Extension, shared: Shared) {
 }
 
 fn register_search(ext: &mut phi::Extension, shared: Shared) {
-    let schema = serde_json::json!({
+    let schema = phi_ext_common::json::json!({
         "type": "object",
         "properties": {
             "query": { "type": "string", "description": "Keywords to search compressed blocks" }
@@ -200,7 +200,7 @@ fn register_search(ext: &mut phi::Extension, shared: Shared) {
     let tool = phi::Tool::new(
         "acp_search",
         "Search compressed blocks by relevance to recover a fact from earlier work.",
-        phi::Schema::raw(serde_json::to_vec(&schema).expect("schema")),
+        phi::Schema::raw(phi_ext_common::json::to_vec(&schema).expect("schema")),
         move |args| {
             let parsed: SearchArgs = parse_args(args)?;
             let guard = shared.borrow();
@@ -234,11 +234,11 @@ fn register_search(ext: &mut phi::Extension, shared: Shared) {
 }
 
 fn register_status(ext: &mut phi::Extension, shared: Shared) {
-    let schema = serde_json::json!({ "type": "object", "properties": {} });
+    let schema = phi_ext_common::json::json!({ "type": "object", "properties": {} });
     let tool = phi::Tool::new(
         "acp_status",
         "Report context usage, active/total blocks, and the current compressible ranges.",
-        phi::Schema::raw(serde_json::to_vec(&schema).expect("schema")),
+        phi::Schema::raw(phi_ext_common::json::to_vec(&schema).expect("schema")),
         move |_args| {
             let mut guard = shared.borrow_mut();
             let outcome = guard.process();
@@ -248,13 +248,14 @@ fn register_status(ext: &mut phi::Extension, shared: Shared) {
                 &guard.config.to_kernel_config(),
             );
             let mut lines = vec![format!(
-                "context: {:.1}% ({}/{} tokens) · active blocks {} · total {} · reclaimed {} tokens",
+                "context: {:.1}% ({}/{} tokens) · active blocks {} · total {} · reclaimed {} tokens · absorbed {} tokens",
                 report.context_usage * 100.0,
                 report.token_count,
                 report.model_context_limit,
                 report.active_blocks,
                 report.total_blocks,
-                report.tokens_compressed
+                report.tokens_compressed,
+                guard.state.stats.absorbed_tokens
             )];
             if let Some(nudge) = &outcome.nudge {
                 let ranges = crate::nudge::format_ranges(
@@ -273,7 +274,7 @@ fn register_status(ext: &mut phi::Extension, shared: Shared) {
 }
 
 fn register_rule(ext: &mut phi::Extension, shared: Shared) {
-    let schema = serde_json::json!({
+    let schema = phi_ext_common::json::json!({
         "type": "object",
         "properties": {
             "action": { "type": "string", "enum": ["add", "list", "remove", "clear"] },
@@ -285,7 +286,7 @@ fn register_rule(ext: &mut phi::Extension, shared: Shared) {
     let tool = phi::Tool::new(
         "acp_rule",
         "Record a persistent reminder that is re-injected every turn and never compressed.",
-        phi::Schema::raw(serde_json::to_vec(&schema).expect("schema")),
+        phi::Schema::raw(phi_ext_common::json::to_vec(&schema).expect("schema")),
         move |args| {
             let parsed: RuleArgs = parse_args(args)?;
             let mut guard = shared.borrow_mut();

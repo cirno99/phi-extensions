@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use phi_ext_common::json::{Value, ValueAsArray, ValueAsScalar, ValueObjectAccess};
 
 use phi_ext_common::config::{load_strict, save_atomic, to_bool, to_enum, to_int, ConfigError};
 use phi_ext_common::paths;
@@ -73,9 +73,9 @@ pub fn normalize(raw: &Value) -> ApprovalConfig {
             .unwrap_or_default()
     };
     ApprovalConfig {
-        enabled: to_bool(raw.get("enabled").unwrap_or(&Value::Null), defaults.enabled),
+        enabled: to_bool(raw.get("enabled"), defaults.enabled),
         mode: to_enum(
-            raw.get("mode").unwrap_or(&Value::Null),
+            raw.get("mode"),
             &[
                 ("safe", ApprovalMode::Safe),
                 ("permissive", ApprovalMode::Permissive),
@@ -83,7 +83,7 @@ pub fn normalize(raw: &Value) -> ApprovalConfig {
             defaults.mode,
         ),
         max_consecutive_denials: to_int(
-            raw.get("maxConsecutiveDenials").unwrap_or(&Value::Null),
+            raw.get("maxConsecutiveDenials"),
             1,
             100,
             i64::from(defaults.max_consecutive_denials),
@@ -113,14 +113,14 @@ pub fn load(path: &Path) -> (ApprovalConfig, Option<String>) {
 
 /// 原子保存配置（写入前先归一化）。
 pub fn save(config: &ApprovalConfig, path: &Path) -> Result<(), ConfigError> {
-    let normalized = normalize(&serde_json::to_value(config)?);
+    let normalized = normalize(&phi_ext_common::json::to_value(config)?);
     save_atomic(path, &normalized)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use phi_ext_common::json::json;
 
     #[test]
     fn defaults_should_be_safe_and_enabled() {

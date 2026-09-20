@@ -45,33 +45,6 @@ impl UsageReport {
     }
 }
 
-/// 会话目录名：与宿主 `internal/project.ProjectDirName` 一致
-/// （`--<去掉前导分隔符、把 / \ : 换成 ->--`）。
-pub fn project_dir_name(cwd: &str) -> String {
-    let mut cleaned = cwd.trim();
-    // 近似 filepath.Clean：去掉末尾分隔符（根路径除外）。
-    while cleaned.len() > 1 && (cleaned.ends_with('/') || cleaned.ends_with('\\')) {
-        cleaned = &cleaned[..cleaned.len() - 1];
-    }
-    if cleaned.is_empty() || cleaned == "." {
-        return "--unknown--".to_string();
-    }
-    let trimmed = cleaned
-        .strip_prefix(['/', '\\'])
-        .unwrap_or(cleaned);
-    let mut out = String::with_capacity(trimmed.len() + 4);
-    for ch in trimmed.chars() {
-        match ch {
-            '/' | '\\' | ':' => out.push('-'),
-            other => out.push(other),
-        }
-    }
-    if out.is_empty() {
-        out.push_str("unknown");
-    }
-    format!("--{out}--")
-}
-
 /// 当前会话文件路径：`<phi_home>/session/<encoded-cwd>/` 下文件名以
 /// `_<session-id>.jsonl`（或恰为 `<session-id>.jsonl`）结尾者。
 pub fn session_file_path(cwd: &str, session_id: &str) -> Option<PathBuf> {
@@ -81,7 +54,7 @@ pub fn session_file_path(cwd: &str, session_id: &str) -> Option<PathBuf> {
     }
     let dir = paths::phi_home()
         .join("session")
-        .join(project_dir_name(cwd));
+        .join(paths::project_dir_name(cwd));
     let exact = format!("{session_id}.jsonl");
     let suffix = format!("_{session_id}.jsonl");
     let entries = std::fs::read_dir(&dir).ok()?;
@@ -113,7 +86,7 @@ pub fn parse_session(contents: &str) -> UsageReport {
         if line.is_empty() {
             continue;
         }
-        let Ok(entry) = serde_json::from_str::<EntryLine>(line) else {
+        let Ok(entry) = phi_ext_common::json::parse_str::<EntryLine>(line) else {
             continue;
         };
         if let Some(ts) = entry.timestamp.as_deref().and_then(parse_rfc3339_ms) {
@@ -290,16 +263,6 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn project_dir_name_should_match_host_encoding() {
-        assert_eq!(
-            project_dir_name("/Users/foo/Phi/"),
-            "--Users-foo-Phi--"
-        );
-        assert_eq!(project_dir_name("/home/me/proj"), "--home-me-proj--");
-        assert_eq!(project_dir_name("."), "--unknown--");
-    }
 
     #[test]
     fn parse_rfc3339_should_handle_utc_and_fraction_and_offset() {

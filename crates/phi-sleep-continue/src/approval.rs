@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use bumpalo::collections::String as ArenaString;
 use bumpalo::Bump;
-use serde_json::Value;
+use phi_ext_common::json::{Value, ValueAsMutObject, ValueAsObject, ValueAsScalar, ValueObjectAccess, Writable};
 
 use crate::config::ApprovalConfig;
 
@@ -455,9 +455,8 @@ fn push_json_string(out: &mut ArenaString<'_>, value: &str) {
 /// 稳定序列化（对象键排序）写入竞技场，与 pi 的 `stableStringify` 语义一致。
 fn write_stable(out: &mut ArenaString<'_>, value: &Value) {
     match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            let encoded = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
-            out.push_str(&encoded);
+        Value::Static(_) | Value::String(_) => {
+            out.push_str(&value.encode());
         }
         Value::Array(items) => {
             out.push('[');
@@ -675,7 +674,7 @@ mod tests {
     use super::*;
     use crate::config::ApprovalMode;
     use phi_ext_common::arena::Scratch;
-    use serde_json::json;
+    use phi_ext_common::json::json;
 
     fn config() -> ApprovalConfig {
         ApprovalConfig::default()
@@ -684,7 +683,7 @@ mod tests {
     /// 用一次性竞技场跑一次审批判定，返回路由与结论。
     fn eval(
         tool_name: &str,
-        input: &serde_json::Value,
+        input: &Value,
         cwd: &str,
         config: &ApprovalConfig,
         store: &ApprovalStore,
@@ -698,7 +697,7 @@ mod tests {
     /// 同上，但连同动作摘要一起返回。
     fn eval_with_subject(
         tool_name: &str,
-        input: &serde_json::Value,
+        input: &Value,
         cwd: &str,
         config: &ApprovalConfig,
         store: &ApprovalStore,
@@ -707,7 +706,7 @@ mod tests {
         evaluate(scratch.arena(), tool_name, input, cwd, config, store)
     }
 
-    fn subject(tool_name: &str, input: &serde_json::Value, cwd: &str) -> ReviewSubject {
+    fn subject(tool_name: &str, input: &Value, cwd: &str) -> ReviewSubject {
         let scratch = Scratch::with_capacity(1024);
         create_review_subject(scratch.arena(), tool_name, input, cwd)
     }

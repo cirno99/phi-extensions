@@ -23,7 +23,7 @@ mod runtime;
 mod techniques;
 
 use phi_ext::{phi, pxb};
-use serde_json::Value;
+use phi_ext_common::json::{Value, ValueAsMutObject, ValueAsScalar, ValueObjectAccess};
 
 use config::RtkMode;
 use rewriter::{
@@ -79,10 +79,9 @@ fn should_inject_source_filter_note(config: &config::RtkIntegrationConfig) -> bo
 /// 把改写后的命令写回工具入参 JSON。
 fn with_command(input: &Value, command: &str) -> Option<Vec<u8>> {
     let mut input = input.clone();
-    input
-        .as_object_mut()?
-        .insert("command".to_string(), Value::String(command.to_string()));
-    serde_json::to_vec(&input).ok()
+    let object = input.as_object_mut()?;
+    let _ = object.insert("command".to_string(), Value::String(command.to_string()));
+    phi_ext_common::json::to_vec(&input).ok()
 }
 
 /// `tool_call`：bash 命令重写。
@@ -96,8 +95,8 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
             return None;
         }
 
-        let input: Value = serde_json::from_slice(&ev.input).ok()?;
-        let command = input.get("command").and_then(Value::as_str)?.to_string();
+        let input = phi_ext_common::json::value(&ev.input).ok()?;
+        let command = input.get("command").and_then(|value| value.as_str())?.to_string();
         if command.trim().is_empty() {
             return None;
         }
@@ -194,7 +193,7 @@ fn register_tool_result(ext: &mut phi::Extension, shared: Shared) {
             return None;
         }
 
-        let mut input: Value = serde_json::from_slice(&ev.input).unwrap_or(Value::Null);
+        let mut input = phi_ext_common::json::value(&ev.input).unwrap_or_default();
         if ev.tool_name == "bash" && input.get("command").is_none() {
             if let (Some(command), Some(map)) = (tracked, input.as_object_mut()) {
                 map.insert("command".to_string(), Value::String(command));
@@ -250,7 +249,7 @@ fn register_events(ext: &mut phi::Extension, shared: Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use phi_ext_common::json::json;
 
     #[test]
     fn trim_message_should_collapse_whitespace_and_truncate() {
@@ -265,7 +264,7 @@ mod tests {
     fn with_command_should_replace_only_command_field() {
         let input = json!({ "command": "ls", "timeout": 5 });
         let bytes = with_command(&input, "rtk ls").expect("应序列化成功");
-        let value: Value = serde_json::from_slice(&bytes).expect("应反序列化成功");
+        let value = phi_ext_common::json::value(&bytes).expect("应反序列化成功");
         assert_eq!(value["command"], json!("rtk ls"));
         assert_eq!(value["timeout"], json!(5));
     }

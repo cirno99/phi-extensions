@@ -5,7 +5,7 @@
 // 与 pi 版的差异：pi 记录 ISO8601 字符串时间戳，这里记录 Unix 毫秒，
 // 避免为格式化引入日期库；统计摘要本身不使用时间戳。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use phi_ext_common::time::now_ms;
 
@@ -26,23 +26,26 @@ pub struct OutputMetricRecord {
     pub savings_percent: f64,
 }
 
+/// 记录上限：长驻进程里统计只增不减会持续占内存，超过上限按插入顺序淘汰最旧的。
+const MAX_RECORDS: usize = 1000;
+
 /// 压缩收益统计器。
 #[derive(Debug, Default)]
 pub struct OutputMetrics {
-    records: Vec<OutputMetricRecord>,
+    records: VecDeque<OutputMetricRecord>,
 }
 
 impl OutputMetrics {
     /// 记录一次压缩。
+    ///
+    /// 字符数由调用方算好传入，避免同一段输出在压缩入口与统计里被重复全量扫描。
     pub fn track(
         &mut self,
-        original: &str,
-        filtered: &str,
+        original_chars: usize,
+        filtered_chars: usize,
         tool: &str,
         techniques: &[String],
     ) -> OutputMetricRecord {
-        let original_chars = original.chars().count();
-        let filtered_chars = filtered.chars().count();
         let savings_percent = if original_chars > 0 {
             let raw = (original_chars - filtered_chars) as f64 / original_chars as f64 * 100.0;
             (raw * 100.0).round() / 100.0
@@ -62,7 +65,10 @@ impl OutputMetrics {
             filtered_chars,
             savings_percent,
         };
-        self.records.push(record.clone());
+        self.records.push_back(record.clone());
+        while self.records.len() > MAX_RECORDS {
+            self.records.pop_front();
+        }
         record
     }
 
@@ -148,7 +154,7 @@ mod tests {
     #[test]
     fn track_should_compute_savings() {
         let mut metrics = OutputMetrics::default();
-        let record = metrics.track("a".repeat(100).as_str(), "a".repeat(25).as_str(), "bash", &["ansi".to_string()]);
+        let record = metrics.track(100, 25, "bash", &["ansi".to_string()]);
         assert_eq!(record.original_chars, 100);
         assert_eq!(record.filtered_chars, 25);
         assert_eq!(record.savings_percent, 75.0);
@@ -159,7 +165,7 @@ mod tests {
     #[test]
     fn track_should_mark_missing_techniques() {
         let mut metrics = OutputMetrics::default();
-        let record = metrics.track("abc", "abc", "read", &[]);
+        let record = metrics.track(3, 3, "read", &[]);
         assert_eq!(record.techniques, "none");
         assert_eq!(record.savings_percent, 0.0);
     }
@@ -174,8 +180,8 @@ mod tests {
     #[test]
     fn summary_should_group_by_tool() {
         let mut metrics = OutputMetrics::default();
-        metrics.track(&"x".repeat(1000), &"x".repeat(100), "bash", &["truncate".to_string()]);
-        metrics.track(&"y".repeat(500), &"y".repeat(500), "read", &[]);
+        metrics.track(1000, 100, "bash", &["truncate".to_string()]);
+        metrics.track(500, 500, "read", &[]);
         let summary = metrics.summary();
         assert!(summary.contains("calls=2"), "got {summary}");
         assert!(summary.contains("saved=900 chars"), "got {summary}");
@@ -186,9 +192,18 @@ mod tests {
     #[test]
     fn clear_should_reset_records() {
         let mut metrics = OutputMetrics::default();
-        metrics.track("a", "b", "bash", &[]);
+        metrics.track(1, 1, "bash", &[]);
         metrics.clear();
         assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn records_should_be_bounded() {
+        let mut metrics = OutputMetrics::default();
+        for index in 0..(MAX_RECORDS + 10) {
+            metrics.track(10, 5, "bash", &[index.to_string()]);
+        }
+        assert_eq!(metrics.len(), MAX_RECORDS);
     }
 
     #[test]

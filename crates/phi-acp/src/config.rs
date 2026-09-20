@@ -47,8 +47,33 @@ pub struct AcpConfig {
     #[serde(default = "default_max_nudges", rename = "maxConsecutiveNudges")]
     pub max_consecutive_nudges: u32,
     /// 是否启用即时吸收（absorb）。
-    #[serde(default, rename = "absorbEnabled")]
+    ///
+    /// phi 上这是**唯一**能真正减少上游 token 的通道：`tool_result` 拦截把巨型
+    /// 工具输出换成 stub 后回写，模型看到的上下文才真的变小。仅写 state.json
+    /// 的 compress 块对宿主历史无效（详见 `crate::absorb`）。
+    #[serde(default = "default_true", rename = "absorbEnabled")]
     pub absorb_enabled: bool,
+    /// 触发 absorb 的最小工具输出 token 数。
+    #[serde(default = "default_absorb_min_tokens", rename = "absorbMinToolTokens")]
+    pub absorb_min_tool_tokens: u64,
+    /// absorb 保留的头部字符数。
+    #[serde(
+        default = "default_absorb_prefix_chars",
+        rename = "absorbKeepPrefixChars"
+    )]
+    pub absorb_keep_prefix_chars: usize,
+    /// absorb 保留的尾部字符数。
+    #[serde(
+        default = "default_absorb_suffix_chars",
+        rename = "absorbKeepSuffixChars"
+    )]
+    pub absorb_keep_suffix_chars: usize,
+    /// absorb 的上下文使用率门槛（0 = 不设门槛）。
+    #[serde(default, rename = "absorbContextThresholdPct")]
+    pub absorb_context_threshold_pct: f64,
+    /// absorb 排除的工具名模式（`*` 通配 / 子串）。
+    #[serde(default, rename = "absorbExcludeTools")]
+    pub absorb_exclude_tools: Vec<String>,
     /// 是否读取宿主会话文件里的真实 token 数（替代本地估算）。
     #[serde(default = "default_true", rename = "useHostTokens")]
     pub use_host_tokens: bool,
@@ -93,6 +118,15 @@ fn default_preserve_messages() -> usize {
 fn default_preserve_tokens() -> u64 {
     5000
 }
+fn default_absorb_min_tokens() -> u64 {
+    1000
+}
+fn default_absorb_prefix_chars() -> usize {
+    2000
+}
+fn default_absorb_suffix_chars() -> usize {
+    800
+}
 fn default_min_compress() -> usize {
     5000
 }
@@ -129,7 +163,12 @@ impl Default for AcpConfig {
             protected_tools: Vec::new(),
             min_compress_range: default_min_compress(),
             max_consecutive_nudges: default_max_nudges(),
-            absorb_enabled: false,
+            absorb_enabled: true,
+            absorb_min_tool_tokens: default_absorb_min_tokens(),
+            absorb_keep_prefix_chars: default_absorb_prefix_chars(),
+            absorb_keep_suffix_chars: default_absorb_suffix_chars(),
+            absorb_context_threshold_pct: 0.0,
+            absorb_exclude_tools: Vec::new(),
             use_host_tokens: true,
             nudge_growth_tokens: default_nudge_growth_tokens(),
             nudge_min_growth_tokens: default_nudge_min_growth_tokens(),
@@ -167,6 +206,11 @@ impl AcpConfig {
         config.nudge.max_context_limit_pct = self.nudge_max_context_pct;
         if let Some(absorb) = config.absorb.as_mut() {
             absorb.enabled = self.absorb_enabled;
+            absorb.min_tool_tokens = self.absorb_min_tool_tokens;
+            absorb.keep_prefix_chars = self.absorb_keep_prefix_chars;
+            absorb.keep_suffix_chars = self.absorb_keep_suffix_chars;
+            absorb.context_threshold_pct = self.absorb_context_threshold_pct;
+            absorb.exclude_tools = self.absorb_exclude_tools.clone();
         }
         config
     }

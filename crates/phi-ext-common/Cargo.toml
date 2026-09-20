@@ -7,22 +7,20 @@ license.workspace = true
 description = "Phi 扩展共用工具：配置持久化、ANSI 处理、文本截断、竞技场分配器"
 
 [features]
-default = ["arena", "jemalloc", "simd"]
+default = ["arena", "jemalloc"]
 # bumpalo 竞技场：单次调用内的临时分配，调用结束整体释放
 arena = ["dep:bumpalo"]
 # tikv-jemallocator 全局分配器：长驻扩展进程的分配热点优化
 jemalloc = ["dep:tikv-jemallocator"]
-# simd-json 快速 JSON 解析（工具入参、配置、状态文件）
-simd = ["dep:simd-json"]
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 # SIMD 字节扫描：ANSI 剥离的 ESC 定位
 memchr.workspace = true
+# 统一 JSON 实现：工具入参、配置与状态文件全部走 simd-json
+simd-json.workspace = true
 bumpalo = { workspace = true, optional = true }
-simd-json = { workspace = true, optional = true }
 
 # jemalloc 在 MSVC 与 Android 上不可用，其余平台走全局分配器
 [target.'cfg(all(not(target_env = "msvc"), not(target_os = "android")))'.dependencies]

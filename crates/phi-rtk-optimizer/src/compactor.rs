@@ -22,7 +22,7 @@ use std::sync::LazyLock;
 use bumpalo::collections::Vec as ArenaVec;
 use bumpalo::Bump;
 use regex::Regex;
-use serde_json::Value;
+use phi_ext_common::json::{Value, ValueAsScalar, ValueObjectAccess};
 
 use phi_ext_common::ansi::{has_ansi, strip_ansi};
 use phi_ext_common::arena::split_lines;
@@ -170,10 +170,13 @@ fn begin_compaction<'a>(text: &'a str, config: &RtkIntegrationConfig) -> Compact
 /// 硬字符截断（如启用且超限）。
 fn apply_truncation(state: &mut CompactionState<'_>, config: &RtkIntegrationConfig) {
     let compaction = &config.output_compaction;
+    let max_chars = compaction.truncate.max_chars as usize;
+    // 字节数是字符数的上界：不超过上限时必然无需截断，省掉一次全量字符计数。
     if compaction.truncate.enabled
-        && state.text.chars().count() > compaction.truncate.max_chars as usize
+        && state.text.len() > max_chars
+        && state.text.chars().count() > max_chars
     {
-        state.text = Cow::Owned(truncate(&state.text, compaction.truncate.max_chars as usize));
+        state.text = Cow::Owned(truncate(&state.text, max_chars));
         state.techniques.push("truncate".to_string());
     }
 }
@@ -816,14 +819,14 @@ pub fn compact_tool_result<'a>(
         return CompactionOutcome::unchanged(content);
     }
 
-    if config.output_compaction.track_savings {
-        if let Some(metrics) = metrics {
-            metrics.track(content, &text, tool_name, &techniques);
-        }
-    }
-
+    // 字符数只算一次，同时供统计与结果结构使用。
     let original_chars = content.chars().count();
     let compacted_chars = text.chars().count();
+    if config.output_compaction.track_savings {
+        if let Some(metrics) = metrics {
+            metrics.track(original_chars, compacted_chars, tool_name, &techniques);
+        }
+    }
     let truncated = has_lossy_compaction(&techniques);
     CompactionOutcome {
         changed: true,
@@ -842,7 +845,7 @@ mod tests {
     use super::*;
     use crate::config::RtkIntegrationConfig;
     use phi_ext_common::arena::Scratch;
-    use serde_json::json;
+    use phi_ext_common::json::json;
 
     fn config() -> RtkIntegrationConfig {
         RtkIntegrationConfig::default()

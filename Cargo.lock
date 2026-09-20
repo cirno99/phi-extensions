@@ -150,7 +150,6 @@ dependencies = [
  "phi-ext",
  "phi-ext-common",
  "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -161,7 +160,6 @@ dependencies = [
  "phi-ext",
  "phi-ext-common",
  "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -172,7 +170,6 @@ dependencies = [
  "phi-ext",
  "phi-ext-common",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -192,7 +189,6 @@ dependencies = [
  "bumpalo",
  "memchr",
  "serde",
- "serde_json",
  "simd-json",
  "thiserror",
  "tikv-jemallocator",
@@ -207,7 +203,6 @@ dependencies = [
  "phi-ext-common",
  "regex",
  "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -219,7 +214,6 @@ dependencies = [
  "phi-ext",
  "phi-ext-common",
  "serde",
- "serde_json",
  "thiserror",
 ]
 

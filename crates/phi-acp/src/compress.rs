@@ -506,14 +506,23 @@ pub fn apply_compression(
                 continue;
             }
             if let Resolution::Ok(resolved) = r {
-                if resolved.boundary_kind == Some(crate::boundaries::BoundaryKind::Block) {
-                    has_block_boundary = true;
-                    continue;
-                }
                 counted += 1;
+                // 原文消息字符。
                 for id in &resolved.message_ids {
                     if let Some(m) = messages.iter().find(|m| &m.id == id) {
                         total_chars += m.text_str().chars().count();
+                    }
+                }
+                // 被消费（重写 / 合并）的块摘要字符也要算。
+                // 旧实现只数 `resolved.message_ids` 且遇 block 边界就整段跳过，
+                // 于是「只用块 id 合并已有 T1 块」这种 T2 蒸馏会被误判为「内容
+                // 太小」而直接拒绝。
+                for block_id in &resolved.nested_block_ids {
+                    if let Some(block) = block_by_id(&work, block_id) {
+                        if block.active {
+                            has_block_boundary = true;
+                            total_chars += block.summary.chars().count();
+                        }
                     }
                 }
             }
@@ -532,7 +541,7 @@ pub fn apply_compression(
                 )
             } else {
                 format!(
-                    "Total compressible content too small ({total_chars} chars across {counted} range(s), min {}). Combine more messages into your range(s).",
+                    "Total compressible content too small ({total_chars} chars across {counted} range(s), min {}). Combine more messages into your range(s), or reference existing blocks by id so their summaries count toward the total.",
                     config.compress.min_compress_range
                 )
             };
@@ -654,7 +663,7 @@ pub fn sync_blocks(messages: &[CoreMessage], state: &CompressionState) -> Compre
 
 /// 隐藏已被消费的 compress 调用（其摘要已入块）。
 fn hide_consumed_compress_calls(
-    messages: &[CoreMessage],
+    messages: Vec<CoreMessage>,
     state: &CompressionState,
 ) -> Vec<CoreMessage> {
     let consumed_call_ids: BTreeSet<&str> = state
@@ -664,9 +673,10 @@ fn hide_consumed_compress_calls(
         .filter_map(|b| b.compress_call_id.as_deref())
         .collect();
     if consumed_call_ids.is_empty() {
-        return messages.to_vec();
+        // 无消费调用时直接原样返回，避免整段消息视图的深拷贝。
+        return messages;
     }
-    let hidden_result_ids: BTreeSet<&str> = messages
+    let hidden_result_ids: BTreeSet<String> = messages
         .iter()
         .filter(|m| m.content_type == ContentType::ToolCall)
         .filter(|m| m.tool_name.as_deref() == Some("compress"))
@@ -676,10 +686,10 @@ fn hide_consumed_compress_calls(
                 .map(|id| consumed_call_ids.contains(id))
                 .unwrap_or(false)
         })
-        .filter_map(|m| m.tool_call_id.as_deref())
+        .filter_map(|m| m.tool_call_id.clone())
         .collect();
     messages
-        .iter()
+        .into_iter()
         .filter(|m| {
             !(m.content_type == ContentType::ToolResult
                 && m.tool_call_id
@@ -687,7 +697,6 @@ fn hide_consumed_compress_calls(
                     .map(|id| hidden_result_ids.contains(id))
                     .unwrap_or(false))
         })
-        .cloned()
         .collect()
 }
 
@@ -743,7 +752,7 @@ pub fn process_turn(
     let mut current = prune(messages, &work);
 
     // 4. hide-compress-calls
-    current = hide_consumed_compress_calls(&current, &work);
+    current = hide_consumed_compress_calls(current, &work);
 
     // 5. recommend
     let protected_refs = compute_protected_refs(&current, &work, config);
@@ -855,16 +864,17 @@ pub fn process_turn(
         work.token_snapshot = snapshot;
     }
 
-    // 填充提醒的上下文细分。
+    // 填充提醒的上下文细分：之前算完就丢（`let _ = bd`），提醒里从来没出现过
+    // `Context breakdown:`，每 turn 还白跑一次全量消息遍历。
     let growth = nudge.breakdown.growth;
-    let bd = compute_context_breakdown(&rendered, token_count, growth);
+    let breakdown = compute_context_breakdown(&rendered, token_count, growth);
     nudge.context_usage = usage;
 
-    let _ = bd;
     ProcessTurnOutcome {
         messages: rendered,
         state: work,
         nudge: Some(nudge),
+        context_breakdown: Some(breakdown),
         terminal_escape,
         truncation_skipped,
     }

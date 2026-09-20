@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use phi_ext::phi;
-use serde_json::Value;
+use phi_ext_common::json::{Value, ValueAsArray, ValueAsScalar, ValueObjectAccess};
 
 /// 编辑器输出保留的最大字符数。
 const MAX_OUTPUT_CHARS: usize = 16_000;
@@ -53,7 +53,7 @@ pub fn register(ext: &mut phi::Extension) {
             },
         )
         .detail_from_args(|args| {
-            serde_json::from_slice::<Value>(args)
+            phi_ext_common::json::value(args)
                 .ok()
                 .and_then(|value| {
                     let command = value.get("command")?.as_str()?;
@@ -67,7 +67,7 @@ pub fn register(ext: &mut phi::Extension) {
 
 /// 解析参数并分发到具体命令。
 pub fn run(args: &[u8]) -> Result<String, String> {
-    let params: Value = serde_json::from_slice(args).map_err(|err| format!("参数解析失败：{err}"))?;
+    let params = phi_ext_common::json::value(args).map_err(|err| format!("参数解析失败：{err}"))?;
     let command = params
         .get("command")
         .and_then(Value::as_str)
@@ -123,7 +123,8 @@ fn editor_path(path: &str) -> Result<PathBuf, String> {
 /// 解析 view_range（必须是两个整数）。
 fn parse_view_range(params: &Value) -> Result<Option<Vec<i64>>, String> {
     match params.get("view_range") {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
+        Some(value) if value.as_null().is_some() => Ok(None),
         Some(value) => {
             let items = value
                 .as_array()
@@ -313,7 +314,7 @@ fn insert_text(path: &Path, insert_line: Option<i64>, new_str: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use phi_ext_common::json::{json, Writable};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("phi-dse-editor-{tag}-{}", std::process::id()));
@@ -327,7 +328,7 @@ mod tests {
         let dir = temp_dir("view");
         let file = dir.join("a.txt");
         fs::write(&file, "alpha\nbeta\n").unwrap();
-        let out = run(json!({"command": "view", "path": file}).to_string().as_bytes()).unwrap();
+        let out = run(json!({"command": "view", "path": file}).encode().as_bytes()).unwrap();
         assert!(out.contains("total of 3 lines"));
         assert!(out.contains("     1  alpha"));
         assert!(out.contains("     2  beta"));
@@ -341,7 +342,7 @@ mod tests {
         fs::write(&file, "1\n2\n3\n4\n").unwrap();
         let out = run(
             json!({"command": "view", "path": file, "view_range": [2, -1]})
-                .to_string()
+                .encode()
                 .as_bytes(),
         )
         .unwrap();
@@ -358,7 +359,7 @@ mod tests {
         fs::write(&file, "x\nx\n").unwrap();
         let err = run(
             json!({"command": "str_replace", "path": file, "old_str": "x", "new_str": "y"})
-                .to_string()
+                .encode()
                 .as_bytes(),
         )
         .unwrap_err();
@@ -373,7 +374,7 @@ mod tests {
         fs::write(&file, "a\nb\n").unwrap();
         run(
             json!({"command": "insert", "path": file, "insert_line": 1, "new_str": "c"})
-                .to_string()
+                .encode()
                 .as_bytes(),
         )
         .unwrap();
@@ -388,7 +389,7 @@ mod tests {
         fs::write(&file, "x").unwrap();
         let err = run(
             json!({"command": "create", "path": file, "file_text": "y"})
-                .to_string()
+                .encode()
                 .as_bytes(),
         )
         .unwrap_err();
@@ -398,7 +399,7 @@ mod tests {
 
     #[test]
     fn relative_path_should_be_rejected() {
-        let err = run(json!({"command": "view", "path": "rel.txt"}).to_string().as_bytes()).unwrap_err();
+        let err = run(json!({"command": "view", "path": "rel.txt"}).encode().as_bytes()).unwrap_err();
         assert!(err.contains("not an absolute path"));
     }
 }

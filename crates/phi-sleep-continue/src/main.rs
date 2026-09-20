@@ -32,7 +32,6 @@ use std::rc::Rc;
 
 use phi_ext::{phi, pxb};
 use phi_ext_common::arena::Scratch;
-use serde_json::Value;
 
 use state::{is_retryable, question_block_reason, summarize_recommended_choices, Shared};
 
@@ -79,7 +78,7 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared, scratch: Rc<RefC
 
         // 提问类工具：自动选推荐项，避免半夜卡在弹窗上。
         if question_tools.contains(ev.tool_name.as_str()) {
-            let summary = serde_json::from_slice::<serde_json::Value>(&ev.input)
+            let summary = phi_ext_common::json::value(&ev.input)
                 .ok()
                 .as_ref()
                 .and_then(summarize_recommended_choices);
@@ -95,7 +94,7 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared, scratch: Rc<RefC
         if !guard.approval.enabled {
             return None;
         }
-        let input: Value = serde_json::from_slice(&ev.input).unwrap_or(Value::Null);
+        let input = phi_ext_common::json::value(&ev.input).unwrap_or_default();
         let cwd = std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -148,7 +147,7 @@ fn register_tool_result(ext: &mut phi::Extension, shared: Shared) {
         if !guard.enabled || !ev.is_error {
             return None;
         }
-        let raw = serde_json::to_string(&ev.content).unwrap_or_default();
+        let raw = phi_ext_common::json::to_string(&ev.content).unwrap_or_default();
         let snippet = truncate_chars(&raw, ERROR_SNIPPET_CHARS);
         if is_retryable(&snippet) {
             guard.pending_retry_reason = Some(format!(
