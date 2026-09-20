@@ -1,0 +1,22 @@
+[package]
+name = "phi-acp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ACP 上下文压缩——phi 扩展（billion-context 插件 + acp-kernel 内核的 Rust 合并移植）"
+
+[[bin]]
+name = "phi-acp"
+path = "src/main.rs"
+
+[dependencies]
+phi-ext.workspace = true
+phi-ext-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# 竞技场：单次 processTurn / 压缩管线内部的临时分配
+bumpalo = { workspace = true }
+# SIMD 字节扫描：tokenizer 的 CJK 探测与 search 分词
+memchr.workspace = true

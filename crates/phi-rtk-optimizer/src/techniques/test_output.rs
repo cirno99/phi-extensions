@@ -127,6 +127,42 @@ static FALLBACK_FAIL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static FAILURE_CONTINUATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s|^-").expect("续行正则应可编译"));
 
+/// 判断一行是否为失败块的起始行。
+///
+/// 逐行跑 7 条正则很贵（失败时尤其）。这里按「首字节 / 必要字面量」派发：
+/// 每条正则只在其必要条件成立时才执行，普通行因此完全不触发正则。
+fn is_failure_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let first = trimmed.as_bytes().first().copied();
+
+    // `^FAIL\s+` / `^FAILED\s+`
+    if first == Some(b'F')
+        && (FAILURE_START_PATTERNS[0].is_match(line) || FAILURE_START_PATTERNS[1].is_match(line))
+    {
+        return true;
+    }
+    // `^\s*●\s+`
+    if trimmed.starts_with('●') && FAILURE_START_PATTERNS[2].is_match(line) {
+        return true;
+    }
+    // `^\s*✕\s+`
+    if trimmed.starts_with('✕') && FAILURE_START_PATTERNS[3].is_match(line) {
+        return true;
+    }
+    // `^\s*\d+/\d+ ... FAIL`（Zig）
+    if first.is_some_and(|b| b.is_ascii_digit()) && FAILURE_START_PATTERNS[6].is_match(line) {
+        return true;
+    }
+    // 未锚定的两条：先用廉价字面量预筛，再跑正则。
+    if line.contains("FAILED") && FAILURE_START_PATTERNS[4].is_match(line) {
+        return true;
+    }
+    if line.contains("panicked") && FAILURE_START_PATTERNS[5].is_match(line) {
+        return true;
+    }
+    false
+}
+
 /// 命令是否属于测试类。
 ///
 /// `normalized_command` 必须是 [`normalize_command_for_detection`] 的结果。
@@ -208,10 +244,7 @@ pub fn aggregate_test_output(
         let mut blank_count = 0usize;
 
         for line in lines.iter().copied() {
-            if FAILURE_START_PATTERNS
-                .iter()
-                .any(|pattern| pattern.is_match(line))
-            {
+            if is_failure_start(line) {
                 if in_failure && !current.is_empty() {
                     failures.push(std::mem::replace(&mut current, ArenaVec::new_in(arena)));
                 }
@@ -308,6 +341,25 @@ mod tests {
     fn aggregate(output: &str, command: Option<&str>) -> Option<String> {
         let scratch = Scratch::with_capacity(1024);
         aggregate_test_output(scratch.arena(), output, command)
+    }
+
+    #[test]
+    fn is_failure_start_should_dispatch_by_first_byte_and_literals() {
+        // 锚定模式。
+        assert!(is_failure_start("FAILED test_foo"));
+        assert!(is_failure_start("FAIL  src/a.rs"));
+        assert!(is_failure_start("  ● some jest failure"));
+        assert!(is_failure_start("  ✕ vitest failure"));
+        assert!(is_failure_start(
+            "1/3 test.foo... FAIL (TestUnexpectedResult)"
+        ));
+        // 未锚定模式。
+        assert!(is_failure_start("test add ... FAILED"));
+        assert!(is_failure_start("thread 'main' panicked at src/lib.rs:1"));
+        // 普通行不应命中。
+        assert!(!is_failure_start("running 3 tests"));
+        assert!(!is_failure_start("test add ... ok"));
+        assert!(!is_failure_start("Finished dev profile"));
     }
 
     #[test]

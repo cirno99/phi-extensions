@@ -1,0 +1,5 @@
+name: phi-deepseek-enhanced
+version: "0.1.0"
+exec: ./phi-deepseek-enhanced
+description: DeepSeek Enhanced（We need 推理风格锚点 + str_replace_editor + Eternal Minimal 运行时守卫）
+enabled: true

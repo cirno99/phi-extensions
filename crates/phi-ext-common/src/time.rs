@@ -1,8 +1,7 @@
 //! 时间工具。
 //!
-//! `now_ms` 原先在 3 个扩展里各写了一份（asymptotic-thinking 的 store、
-//! sleep-continue 的 state、rtk-optimizer 的 runtime/metrics），这里收敛成
-//! 单一实现。
+//! `now_ms` 原先在多个扩展里各写了一份（sleep-continue 的 state、
+//! rtk-optimizer 的 runtime/metrics 等），这里收敛成单一实现。
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -22,10 +22,11 @@ if [[ "${1:-}" == "--debug" ]]; then
 fi
 
 EXTENSIONS=(
-  phi-asymptotic-thinking
   phi-rtk-optimizer
   phi-sleep-continue
   phi-cache-optimizer
+  phi-acp
+  phi-deepseek-enhanced
 )
 
 PHI_HOME="${PHI_HOME:-$HOME/.phi}"

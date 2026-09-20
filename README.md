@@ -7,10 +7,11 @@
 
 | crate | 来源（pi 扩展） | 说明 |
 |---|---|---|
-| [`phi-asymptotic-thinking`](crates/phi-asymptotic-thinking) | `asymptotic-thinking.js` | 渐近式思考六态状态机：3 个工具 + 状态守卫转向 + `/asymptotic-*` 命令 |
 | [`phi-rtk-optimizer`](crates/phi-rtk-optimizer) | `pi-rtk-optimizer.js` | RTK 命令重写（`rtk rewrite` 子进程）+ 工具输出压缩（ansi/build/test/git/linter/search/source/truncate） |
 | [`phi-sleep-continue`](crates/phi-sleep-continue) | `sleep-continue.js` | 无人值守自动继续 + 提问拦截 + 失败重试，并参照 [pi-auto-approval](https://github.com/Europa2061/pi-auto-approval) 增加规则化自动审批 |
 | [`phi-cache-optimizer`](crates/phi-cache-optimizer) | `pi-cache-optimizer.js` | 缓存优化配置 + 能力诊断（可落地子集，见下） |
+| [`phi-acp`](crates/phi-acp) | `billion-context` + `acp-kernel` | ACP 上下文压缩：模型驱动、三级 LSM、可解压/可检索（合并移植，见下） |
+| [`phi-deepseek-enhanced`](crates/phi-deepseek-enhanced) | `deepseek-enhanced.ts` | We-need 推理风格锚点 + `str_replace_editor` 工具 + Eternal Minimal 运行时守卫（可落地子集，见下） |
 | [`phi-ext-common`](crates/phi-ext-common) | — | 共享工具库：路径、配置原子读写、ANSI、文本截断、用量统计、竞技场分配器、jemalloc |
 
 > `pi-statusline` **未移植**：phi 宿主已自带状态栏。其中两项纯计算已补进
@@ -30,16 +31,6 @@ scripts/install.sh --debug  # 构建 debug
 `~/.phi/extensions/<name>/` 即可。
 
 ## 使用
-
-### asymptotic-thinking
-
-| 入口 | 说明 |
-|---|---|
-| `asymptotic-think_set-task-info` | 设定任务画像（难度 / 大类型 / 小类型，含 Zig） |
-| `asymptotic-think_transition` | 状态流转（六态，带合法性校验） |
-| `asymptotic-think_status` | 查询状态机快照与建议推理参数 |
-| `/asymptotic-status` | 展示快照并写入会话 |
-| `/asymptotic-toggle [on\|off]` | 开关框架 |
 
 ### rtk-optimizer
 
@@ -68,6 +59,60 @@ scripts/install.sh --debug  # 构建 debug
 
 配置：`~/.phi/extensions/phi-cache-optimizer/config.json`。
 
+### acp（上下文压缩）
+
+把 [billion-context](https://github.com/ranxianglei/billion-context)（宿主插件）与
+[acp-kernel](https://github.com/ranxianglei/acp-kernel)（压缩算法内核）**合并**为一个
+扩展：内核（ref 分配、边界解析、三级 LSM 块、推荐/提醒、紧急截断、解压、检索）
+逐条移植为纯 Rust 逻辑并完整单测；插件外壳适配为 phi 的钩子与工具。
+
+| 入口 | 说明 |
+|---|---|
+| `compress` 工具 | 模型写摘要压缩一个 ref 区间；返回新建块账本（`bN=mAAAAA–mBBBBB`） |
+| `acp_decompress` / `acp_search` | 恢复被压缩内容 / 按相关度检索块 |
+| `acp_status` | 使用率、块统计与当前可压缩范围 |
+| `acp_rule` | 记录永不压缩、每轮重注入的持久规则 |
+| `/acp status\|compress\|enable\|disable\|config …\|rules\|reset\|help` | 状态面板、手动压缩与配置 |
+
+`before_agent_start` 注入压缩哲学与持久规则；`turn_stopping` 按增长量发提醒
+（带连续上限防死循环）；`user_input` / `tool_call` / `tool_result` 维护本扩展
+自己的消息观测视图。配置：`~/.phi/extensions/phi-acp/config.json`，
+状态：`~/.phi/extensions/phi-acp/state/state.json`。
+
+**压缩频率调优**：扩展层对内核提醒阈值做了更积极的覆盖（可用 `/acp config` 调整）——
+`growth-tokens=20000` / `min-growth-tokens=10000` / `min-context-pct=0.30` /
+`max-context-pct=0.65` / `tier2-trigger=3` / `tier3-trigger=6`。相比内核默认
+（阈值 50k、两次提醒间新增 22.5k、使用率 45% 才提醒），压缩触发得更频繁。
+
+**与 pi 版的差异**：billion-context 在 pi 里是一个改基地址 + 改 `fetch` 的 HTTP
+代理（`before_provider_request` 重写请求体）。phi **没有请求体钩子、也拿不到
+消息历史**，因此代理层无法落地；本扩展保留内核与插件交互面，在自身观测到的
+消息视图上运行内核。详见 [PLAN.md](PLAN.md)。
+
+### deepseek-enhanced
+
+把 [Oh My Pi deepseek-enhanced.ts](https://github.com/mytianyi0712/DeepSeek-Enhanced-for-Oh-My-Pi) 移植为 phi 扩展。
+
+| 入口 | 说明 |
+|---|---|
+| `str_replace_editor` 工具 | `view` / `create` / `str_replace` / `insert`，行为与 pi 版一致 |
+| `/deepseek status\|on\|off\|anchor\|minimal\|transport\|strip\|reset\|help` | 配置与状态 |
+
+`before_agent_start` 注入 “We need to …” 推理风格锚点并剥离用户消息里的
+Today/cwd 系统提醒；`tool_call` 在 `minimal` 模式下阻止非核心工具直呼。
+配置：`~/.phi/extensions/phi-deepseek-enhanced/config.json`。
+
+**与 pi 版的差异**（phi 宿主能力缺失）：
+
+- **拿不到模型信息**：PXB 子进程协议不向扩展推送 model，无法只对 DeepSeek 生效，
+  改为全局开关。
+- **无法收缩工具清单**：无 `GetAllTools` / `SetActiveTools` RPC，模型始终能看到全部
+  工具；Eternal Minimal 退化为「运行时阻止直呼」，因此 `minimal` 默认关闭。
+- **无法落地 `xd://` 网关**：扩展不能调用别的工具，read/write 的 `xd://` 语义是 OMP
+  宿主内建能力。
+- **无请求体钩子 / 拿不到消息历史 / 拿不到 assistant 推理文本**：provider 载荷过滤、
+  thinking 与 256k token 上限、消息过滤、CoT 回归再注入均无法实现。
+
 ## pi → phi 的关键差异
 
 phi 的 Rust SDK 与 pi 的扩展 API 并不等价。完整映射表见 [PLAN.md](PLAN.md)，
@@ -83,10 +128,14 @@ phi 的 Rust SDK 与 pi 的扩展 API 并不等价。完整映射表见 [PLAN.md
   由对应命令统一展示。
 - **没有定时器与 abort**：sleep-continue 的看门狗、指数退避重试、Esc 中断
   检测均无对应能力，改为即时重试 + 连续失败计数。
-- **没有用量事件**：无法统计缓存命中率与 token 速率；计算函数已就绪待用。
+- **没有用量事件**：phi 不向扩展推送 usage；缓存命中率与 token 速率改为读取
+  宿主持久化的会话 JSONL（`~/.phi/session/<cwd>/<id>.jsonl`）里的 usage 计算，
+  由 `/cache-optimizer stats` 展示，并同步到宿主底部状态行（`ctx.set_status`）。
+  注意：composer 上那行 token 标签由宿主渲染，扩展无法写入，只能写其下方的
+  扩展状态区。
 - **转向只能靠 `turn_stopping`**：pi 的 `sendMessage(steer)` 在 phi 对应
   `on_turn_stopping` 返回 `Continue + message`，只在「本轮无工具调用、
-  即将结束」时触发一次；asymptotic-thinking 因此加了连续转向上限防止死循环。
+  即将结束」时触发一次；据此加了连续转向上限防止死循环。
 
 ## 性能
 
@@ -143,7 +192,7 @@ rtk 原先自带的 ANSI 正则实现漏剥带私有参数的 CSI 序列：
 ## 开发
 
 ```bash
-cargo test --workspace     # 291 个测试（含 4 个 PXB 生命周期端到端冒烟测试）
+cargo test --workspace     # 363 个测试（含 5 个 PXB 生命周期端到端冒烟测试）
 cargo build --release      # 构建全部扩展
 cargo clippy --workspace --all-targets   # 静态检查（当前零告警）
 ```
@@ -151,13 +200,3 @@ cargo clippy --workspace --all-targets   # 静态检查（当前零告警）
 每个扩展都带一个 `tests/pbx_handshake.rs`：以子进程方式启动二进制，
 走完 `Hello → HelloAck → Register* → Ready → Shutdown → ShutdownAck`，
 并断言注册出来的命令/工具名。
-
-代码生成：`scripts/gen-prompts.mjs` 从 pi 版 asymptotic-thinking 的 27 个
-TS 提示词模块生成 `prompts.rs`，并内置一份 Zig 提示词（pi 上游没有 Zig 模块），
-使语言覆盖包含 Zig。
-
-```bash
-bun scripts/gen-prompts.mjs \
-  ~/.pi/agent/extensions/asymptotic-thinking/src \
-  crates/phi-asymptotic-thinking/src/prompts.rs
-```

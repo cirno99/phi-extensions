@@ -53,10 +53,11 @@ pub fn capabilities() -> Vec<Capability> {
         },
         Capability {
             name: "缓存命中率 / token 速率统计",
-            applicability: Applicability::Unsupported,
-            detail: "phi 不向扩展推送会话用量（usage）事件。计算函数已在 \
-                     phi-ext-common::stats 中实现（cache_hit_rate / tokens_per_second），\
-                     待宿主提供用量后即可直接启用。",
+            applicability: Applicability::Active,
+            detail: "读取宿主持久化的会话 JSONL（<phi_home>/session/<cwd>/<id>.jsonl）\
+                     里的 usage，用 phi-ext-common::stats 计算命中率与 token 速率，\
+                     由 /cache-optimizer stats 展示，并通过 ctx.set_status 同步到\
+                     宿主底部状态行（token 状态栏旁的扩展状态区）。",
         },
         Capability {
             name: "配置持久化与能力诊断（/cache-optimizer）",

@@ -142,9 +142,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "phi-asymptotic-thinking"
+name = "phi-acp"
 version = "0.1.0"
 dependencies = [
+ "bumpalo",
+ "memchr",
  "phi-ext",
  "phi-ext-common",
  "serde",
@@ -164,6 +166,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "phi-deepseek-enhanced"
+version = "0.1.0"
+dependencies = [
+ "phi-ext",
+ "phi-ext-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "phi-ext"
 version = "0.6.1"
 source = "git+https://github.com/pulseaiclub/phi?branch=main#14b4212cdf6b8440aa9be2088de892310c96697e"
@@ -178,6 +190,7 @@ name = "phi-ext-common"
 version = "0.1.0"
 dependencies = [
  "bumpalo",
+ "memchr",
  "serde",
  "serde_json",
  "simd-json",

@@ -2,8 +2,7 @@
 //
 // 以子进程方式启动本 crate 的扩展二进制，走完
 // Hello（扩展→宿主）→ HelloAck（宿主→扩展）→ Register* → Ready
-// → Shutdown → ShutdownAck，并校验注册出来的命令/工具名，
-// 确保扩展真的能被宿主加载。
+// → Shutdown → ShutdownAck，并校验注册出来的命令/工具名。
 
 use std::io::BufReader;
 use std::process::{Command, Stdio};
@@ -11,16 +10,22 @@ use std::process::{Command, Stdio};
 use phi_ext::pxb;
 
 /// 本 crate 的扩展二进制路径（由 cargo 注入）。
-const BIN: &str = env!("CARGO_BIN_EXE_phi-asymptotic-thinking");
+const BIN: &str = env!("CARGO_BIN_EXE_phi-acp");
 
 /// 扩展名（Hello 里自报的名字）。
-const EXTENSION_NAME: &str = "phi-asymptotic-thinking";
+const EXTENSION_NAME: &str = "phi-acp";
 
 /// 期望注册的斜杠命令。
-const EXPECTED_COMMANDS: &[&str] = &["asymptotic-status", "asymptotic-toggle"];
+const EXPECTED_COMMANDS: &[&str] = &["acp"];
 
 /// 期望注册的 LLM 工具。
-const EXPECTED_TOOLS: &[&str] = &["asymptotic-think_transition", "asymptotic-think_set-task-info", "asymptotic-think_status"];
+const EXPECTED_TOOLS: &[&str] = &[
+    "compress",
+    "acp_decompress",
+    "acp_search",
+    "acp_status",
+    "acp_rule",
+];
 
 #[test]
 fn extension_should_complete_pbx_lifecycle() {
@@ -38,7 +43,7 @@ fn extension_should_complete_pbx_lifecycle() {
     let frame = pxb::read_frame(&mut reader).expect("应能收到 Hello");
     assert_eq!(frame.header.typ, pxb::TYPE_HELLO, "首帧应为 Hello");
     let hello = pxb::Hello::decode(&frame.body).expect("应能解码 Hello");
-    assert_eq!(hello.name, EXTENSION_NAME, "扩展名应为 {}", EXTENSION_NAME);
+    assert_eq!(hello.name, EXTENSION_NAME, "扩展名应为 {EXTENSION_NAME}");
     assert_eq!(hello.protocol, pxb::PROTOCOL_VERSION);
 
     // 2) 宿主回 HelloAck。
@@ -54,7 +59,7 @@ fn extension_should_complete_pbx_lifecycle() {
 
     // 3) 收集 Register*，直到 Ready。
     let mut commands: Vec<String> = Vec::new();
-    let mut tools: Vec<String> = Vec::new();
+    let mut tool_names: Vec<String> = Vec::new();
     loop {
         let frame = pxb::read_frame(&mut reader).expect("应能收到注册帧");
         match frame.header.typ {
@@ -66,7 +71,7 @@ fn extension_should_complete_pbx_lifecycle() {
             pxb::TYPE_REGISTER_TOOL => {
                 let message = pxb::RegisterTool::decode(&frame.body).expect("解码工具注册");
                 assert!(!message.name.is_empty(), "工具名不应为空");
-                tools.push(message.name);
+                tool_names.push(message.name);
             }
             // Subscribe 声明订阅/拦截兴趣，内容不参与本测试断言。
             pxb::TYPE_SUBSCRIBE => {}
@@ -83,8 +88,8 @@ fn extension_should_complete_pbx_lifecycle() {
     }
     for expected in EXPECTED_TOOLS {
         assert!(
-            tools.iter().any(|name| name == expected),
-            "缺少工具 {expected}，实际：{tools:?}"
+            tool_names.iter().any(|name| name == expected),
+            "缺少工具 {expected}，实际：{tool_names:?}"
         );
     }
 

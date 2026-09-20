@@ -1,0 +1,5 @@
+name: phi-acp
+version: "0.1.0"
+exec: ./phi-acp
+description: ACP 上下文压缩（模型驱动、三级 LSM、可解压/可检索）
+enabled: true

@@ -8,8 +8,9 @@
 //   因此「稳定候选前置 / skills 压缩 / session-overview 去抖」都无法实现；
 // - 没有 `before_provider_request` / `before_provider_headers`，
 //   因此无法注入 `prompt_cache_key`、cache retention 或工具排序；
-// - 不推送会话用量事件，因此无法统计缓存命中率与 token 速率
-//   （计算函数已在 `phi-ext-common::stats` 就绪）。
+// - 不推送会话用量事件；缓存命中率与 token 速率改为读取宿主持久化的会话
+//   JSONL（`<phi_home>/session/<cwd>/<id>.jsonl`）里的 usage，配合
+//   `phi-ext-common::stats` 计算（见 `usage.rs`）。
 //
 // 本扩展因此只保留**确实可落地**的部分：配置持久化 + 能力诊断
 // （`/cache-optimizer status|doctor|config|enable|disable|reset|stats`），
@@ -19,6 +20,7 @@ mod commands;
 mod config;
 mod doctor;
 mod runtime;
+mod usage;
 
 use phi_ext::{phi, pxb};
 

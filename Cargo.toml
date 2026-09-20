@@ -2,10 +2,11 @@
 resolver = "2"
 members = [
     "crates/phi-ext-common",
-    "crates/phi-asymptotic-thinking",
     "crates/phi-rtk-optimizer",
     "crates/phi-sleep-continue",
     "crates/phi-cache-optimizer",
+    "crates/phi-acp",
+    "crates/phi-deepseek-enhanced",
 ]
 
 [workspace.package]
@@ -29,6 +30,8 @@ bumpalo = { version = "3", features = ["collections"] }
 simd-json = "0.18"
 # 全局分配器：长驻扩展进程的分配热点优化
 tikv-jemallocator = "0.6"
+# SIMD 字节扫描：tokenizer 的 CJK 探测与 search 的分词热路径
+memchr = "2"
 
 [profile.release]
 lto = "thin"

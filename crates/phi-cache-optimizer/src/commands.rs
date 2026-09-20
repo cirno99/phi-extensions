@@ -16,7 +16,7 @@ const USAGE: &str = "\u{1F4CB} /cache-optimizer 子命令：\n\
   enable | disable                    — 开关扩展\n\
   config footer-mode session|total|process — 设置 footer 统计口径\n\
   config prompt-cache-key auto|omit   — 设置 prompt_cache_key 策略\n\
-  stats                               — 说明统计口径与当前数据来源\n\
+  stats                               — 显示本会话缓存命中率与 token 速率\n\
   reset                               — 恢复默认配置（需确认）\n\
   help                                — 显示本说明";
 
@@ -104,16 +104,12 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                     }
                 }
                 "stats" => {
-                    ctx.notify(
-                        "info",
-                        "\u{1F4CA} 缓存统计口径\n\
-                         pi 版从 provider 响应里累计 input / output / cacheRead / cacheWrite / cost，\
-                         并据此计算命中率与 token 速率。\n\
-                         phi 目前不向扩展推送会话用量事件，因此没有可统计的数据。\n\
-                         计算函数已就绪（phi-ext-common::stats::cache_hit_rate / tokens_per_second），\
-                         待宿主提供用量后可直接启用。\n\
-                         临时替代：用 /cache-optimizer doctor 查看能力现状。",
-                    );
+                    let cwd = ctx.cwd().to_string();
+                    let session_id = ctx.session_id().to_string();
+                    let report = crate::usage::load(&cwd, &session_id);
+                    ctx.notify("info", &crate::usage::render(report.as_ref()));
+                    // 同步到宿主底部状态行（token 状态栏旁的扩展状态区）。
+                    ctx.set_status(&crate::usage::footer_status(report.as_ref()));
                 }
                 "reset" => {
                     if !ctx

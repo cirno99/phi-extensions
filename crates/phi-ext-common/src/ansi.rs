@@ -50,30 +50,30 @@ impl TextSink for bumpalo::collections::String<'_> {
 
 /// 将去掉 ANSI 转义序列后的结果追加到 `out`。
 ///
-/// 该函数按字节扫描，对 UTF-8 是安全的：只有 `0x1B` 会被识别为转义起始，
-/// 而 `0x1B` 永远不会出现在 UTF-8 多字节序列的续字节中。
+/// 对 UTF-8 是安全的：只有 `0x1B` 会被识别为转义起始，而 `0x1B` 永远不会出现
+/// 在 UTF-8 多字节序列的续字节中。
+///
+/// 性能：普通文本按「从当前位置到下一个 `0x1B`」整段拷贝，用 [`memchr`] 的 SIMD
+/// 扫描定位下一个 `ESC`，避免逐字节比较；无转义序列的输入因此只做一次扫描 +
+/// 一次 `push_str`。
 pub fn strip_ansi_into<S: TextSink + ?Sized>(input: &str, out: &mut S) {
     let bytes = input.as_bytes();
-    let mut i = 0usize;
     let mut plain_start = 0usize;
 
-    while i < bytes.len() {
-        if bytes[i] != 0x1B {
-            i += 1;
-            continue;
+    while plain_start < bytes.len() {
+        match memchr::memchr(0x1B, &bytes[plain_start..]) {
+            Some(offset) => {
+                let esc = plain_start + offset;
+                if plain_start < esc {
+                    out.push_str(&input[plain_start..esc]);
+                }
+                plain_start = skip_escape(bytes, esc);
+            }
+            None => {
+                out.push_str(&input[plain_start..]);
+                return;
+            }
         }
-
-        // 先把转义序列之前的普通片段原样写出。
-        if plain_start < i {
-            out.push_str(&input[plain_start..i]);
-        }
-
-        i = skip_escape(bytes, i);
-        plain_start = i;
-    }
-
-    if plain_start < bytes.len() {
-        out.push_str(&input[plain_start..]);
     }
 }
 
