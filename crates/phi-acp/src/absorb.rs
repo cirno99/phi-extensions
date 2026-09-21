@@ -46,6 +46,8 @@ pub const NEVER_ABSORB_TOOLS: &[&str] = &[
 pub struct AbsorbPlan {
     /// 替换后的文本。
     pub text: String,
+    /// 原文句柄（`aN`）：模型可用 `acp_decompress aN` 取回逐字原文。
+    pub handle: String,
     /// 原始 token 数。
     pub original_tokens: u64,
     /// 替换后 token 数。
@@ -62,6 +64,23 @@ impl AbsorbPlan {
 /// 工具名是否禁止吸收。
 pub fn is_never_absorbed(tool_name: &str) -> bool {
     NEVER_ABSORB_TOOLS.contains(&tool_name)
+}
+
+/// 解析可逆吸收句柄（`a3` / `A3`）。
+///
+/// 必须带 `a` 前缀：裸数字留给块 id（`b3` / `3`），否则 `acp_decompress 3`
+/// 会歧义。
+pub fn parse_absorb_handle(arg: &str) -> Option<String> {
+    let trimmed = arg.trim().to_ascii_lowercase();
+    let digits = trimmed.strip_prefix('a')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(format!("a{n}"))
 }
 
 /// 工具名是否命中 `excludeTools` 里的任一「子串或 glob 前后缀」模式。
@@ -161,6 +180,10 @@ fn resolve_min_tokens(usage: f64, config: &AbsorbConfig) -> u64 {
 }
 
 /// 规划一次吸收；`None` 表示这条结果保持原样。
+/// `handle` 是调用方预分配的句柄（`aN`）：`reversible` 为真时 stub 里会带上它，
+/// 模型据此用 `acp_decompress <handle>` 取回原文（调用方负责把原文写进
+/// [`crate::absorb_store`]）；为假时退化为「已丢弃、需重跑」的旧措辞，
+/// 不向模型承诺一个取不回来的句柄。
 ///
 /// `context_usage` 传当前使用率（0 表示未知）；只有 `contextThresholdPct > 0`
 /// 时才用它做门槛判断。
@@ -170,6 +193,8 @@ pub fn plan_absorb(
     is_error: bool,
     context_usage: f64,
     config: &AbsorbConfig,
+    handle: &str,
+    reversible: bool,
 ) -> Option<AbsorbPlan> {
     if !config.enabled || is_error {
         return None;
@@ -210,9 +235,16 @@ pub fn plan_absorb(
     );
     let elided_chars = total_chars - keep_prefix - keep_suffix;
     let marker = format!(
-        "...{ABSORB_MARKER} {elided_chars} chars (~{} tokens) elided from {tool_name} output; \
-         raw output was discarded — re-run the tool if you need the missing middle.\n\n",
+        "...{ABSORB_MARKER} {elided_chars} chars (~{} tokens) elided from {tool_name} output; {}",
         original_tokens.saturating_sub(count_tokens(&prefix) + count_tokens(&suffix)),
+        if reversible {
+            format!(
+                "full output stored as `{handle}` — call `acp_decompress {handle}` to restore it verbatim.\n\n"
+            )
+        } else {
+            "raw output was discarded — re-run the tool if you need the missing middle.\n\n"
+                .to_string()
+        },
     );
     let text = format!("{prefix}\n\n{marker}{suffix}");
 
@@ -222,6 +254,7 @@ pub fn plan_absorb(
     }
     Some(AbsorbPlan {
         text,
+        handle: handle.to_string(),
         original_tokens,
         stub_tokens,
     })
@@ -243,26 +276,42 @@ mod tests {
 
     #[test]
     fn small_output_should_be_untouched() {
-        assert!(plan_absorb("bash", "hello", false, 0.0, &config()).is_none());
+        assert!(plan_absorb("bash", "hello", false, 0.0, &config(), "a1", true).is_none());
     }
 
     #[test]
     fn large_output_should_be_absorbed_with_head_and_tail() {
         let big = format!("HEAD{}TAIL", "x".repeat(60_000));
-        let plan = plan_absorb("bash", &big, false, 0.0, &config()).expect("应吸收");
+        let plan = plan_absorb("bash", &big, false, 0.0, &config(), "a1", true).expect("应吸收");
         assert!(plan.text.starts_with("HEAD"));
         assert!(plan.text.ends_with("TAIL"));
         assert!(plan.text.contains(ABSORB_MARKER));
+        // 可逆：stub 必须带句柄，模型据此用 acp_decompress 取回原文。
+        assert_eq!(plan.handle, "a1");
+        assert!(plan.text.contains("`a1`"));
+        assert!(plan.text.contains("acp_decompress a1"));
+        assert!(!plan.text.contains("raw output was discarded"));
         assert!(plan.reclaimed_tokens() > 0);
+    }
+
+    #[test]
+    fn absorb_handle_should_require_a_prefix() {
+        assert_eq!(parse_absorb_handle("a3").as_deref(), Some("a3"));
+        assert_eq!(parse_absorb_handle(" A12 ").as_deref(), Some("a12"));
+        // 裸数字属于块 id，不应当被当成句柄。
+        assert!(parse_absorb_handle("3").is_none());
+        assert!(parse_absorb_handle("b3").is_none());
+        assert!(parse_absorb_handle("a0").is_none());
+        assert!(parse_absorb_handle("ax").is_none());
     }
 
     #[test]
     fn errors_and_acp_tools_should_be_untouched() {
         let big = "x".repeat(60_000);
-        assert!(plan_absorb("bash", &big, true, 0.0, &config()).is_none());
+        assert!(plan_absorb("bash", &big, true, 0.0, &config(), "a1", true).is_none());
         for tool in NEVER_ABSORB_TOOLS {
             assert!(
-                plan_absorb(tool, &big, false, 0.0, &config()).is_none(),
+                plan_absorb(tool, &big, false, 0.0, &config(), "a1", true).is_none(),
                 "{tool}"
             );
         }
@@ -271,8 +320,8 @@ mod tests {
     #[test]
     fn already_absorbed_should_be_idempotent() {
         let big = format!("HEAD{}TAIL", "x".repeat(60_000));
-        let plan = plan_absorb("bash", &big, false, 0.0, &config()).expect("应吸收");
-        assert!(plan_absorb("bash", &plan.text, false, 0.0, &config()).is_none());
+        let plan = plan_absorb("bash", &big, false, 0.0, &config(), "a1", true).expect("应吸收");
+        assert!(plan_absorb("bash", &plan.text, false, 0.0, &config(), "a1", true).is_none());
     }
 
     #[test]
@@ -284,8 +333,8 @@ mod tests {
             always_above_tokens: 0,
             ..config()
         };
-        assert!(plan_absorb("bash", &big, false, 0.2, &gated).is_none());
-        assert!(plan_absorb("bash", &big, false, 0.7, &gated).is_some());
+        assert!(plan_absorb("bash", &big, false, 0.2, &gated, "a1", true).is_none());
+        assert!(plan_absorb("bash", &big, false, 0.7, &gated, "a1", true).is_some());
     }
 
     /// 门槛之下，「巨型」输出仍应被吸收：否则早期会话 / 高门槛会话里，
@@ -299,12 +348,12 @@ mod tests {
         };
         // ~15000 token，远超 always_above_tokens：低水位也吸收。
         let huge = "x".repeat(60_000);
-        assert!(plan_absorb("bash", &huge, false, 0.1, &gated).is_some());
+        assert!(plan_absorb("bash", &huge, false, 0.1, &gated, "a1", true).is_some());
         // ~1000 token，低于 always_above_tokens：低水位不吸收。
         let medium = "x".repeat(4_000);
-        assert!(plan_absorb("bash", &medium, false, 0.1, &gated).is_none());
+        assert!(plan_absorb("bash", &medium, false, 0.1, &gated, "a1", true).is_none());
         // 越过门槛后，同一「中等」输出由常规门槛接管（min_tool_tokens 已降）。
-        assert!(plan_absorb("bash", &medium, false, 0.9, &gated).is_some());
+        assert!(plan_absorb("bash", &medium, false, 0.9, &gated, "a1", true).is_some());
     }
 
     #[test]
@@ -330,7 +379,7 @@ mod tests {
             ..config()
         };
         let mid = "x".repeat(9000);
-        assert!(plan_absorb("bash", &mid, false, 0.0, &cfg).is_none());
+        assert!(plan_absorb("bash", &mid, false, 0.0, &cfg, "a1", true).is_none());
     }
 
     /// 保留窗口随使用率单调收缩：这是「吸到高水位就多删」的调节回路。
@@ -368,9 +417,9 @@ mod tests {
         };
         // ~800 token（3200 字符）的中等输出：门槛 1000 时不够格。
         let mid = format!("HEAD{}TAIL", "x".repeat(3200));
-        assert!(plan_absorb("bash", &mid, false, 0.30, &cfg).is_none());
+        assert!(plan_absorb("bash", &mid, false, 0.30, &cfg, "a1", true).is_none());
         // 接近上限时门槛降到 400（降 60%），同一条输出被吸收。
-        assert!(plan_absorb("bash", &mid, false, 0.95, &cfg).is_some());
+        assert!(plan_absorb("bash", &mid, false, 0.95, &cfg, "a1", true).is_some());
     }
 
     /// 回收量必须随压力单调递增（更高使用率 → 保留窗口更小 → 删得更多）。
@@ -383,8 +432,8 @@ mod tests {
             ..config()
         };
         let big = format!("HEAD{}TAIL", "y".repeat(80_000));
-        let low = plan_absorb("bash", &big, false, 0.35, &cfg).expect("应吸收");
-        let high = plan_absorb("bash", &big, false, 0.95, &cfg).expect("应吸收");
+        let low = plan_absorb("bash", &big, false, 0.35, &cfg, "a1", true).expect("应吸收");
+        let high = plan_absorb("bash", &big, false, 0.95, &cfg, "a1", true).expect("应吸收");
         assert!(
             high.reclaimed_tokens() > low.reclaimed_tokens(),
             "高压下应回收更多：low={} high={}",

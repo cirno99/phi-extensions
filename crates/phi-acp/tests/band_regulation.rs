@@ -122,7 +122,7 @@ fn simulate(seed: u64, turns: usize, params: &Params) -> Simulation {
             let text = fake_tool_output(&mut rng, tokens);
             let original = count_tokens(&text);
             let usage = context as f64 / params.limit as f64;
-            match plan_absorb("bash", &text, false, usage, &config) {
+            match plan_absorb("bash", &text, false, usage, &config, "a1", true) {
                 Some(plan) => {
                     reclaimed += plan.reclaimed_tokens();
                     absorbs += 1;
@@ -223,8 +223,8 @@ fn absorb_threshold_lifts_the_floor() {
 fn reclaim_ratio_should_grow_with_usage() {
     let config = absorb_config(0.30);
     let text = fake_tool_output(&mut Rng(7), 8_000);
-    let low = plan_absorb("bash", &text, false, 0.35, &config).expect("低水位应吸收");
-    let high = plan_absorb("bash", &text, false, 0.95, &config).expect("高水位应吸收");
+    let low = plan_absorb("bash", &text, false, 0.35, &config, "a1", true).expect("低水位应吸收");
+    let high = plan_absorb("bash", &text, false, 0.95, &config, "a1", true).expect("高水位应吸收");
     assert!(
         high.reclaimed_tokens() > low.reclaimed_tokens(),
         "高压下应回收更多：low={} high={}",

@@ -80,6 +80,8 @@ impl Runtime {
     pub fn new_isolated() -> Self {
         let mut runtime = Self::new();
         runtime.persist_enabled = false;
+        // 连可逆吸收的原文也不要落到用户真实的 `state/absorbed` 目录。
+        crate::absorb_store::set_enabled(false);
         runtime
     }
 
@@ -171,10 +173,27 @@ impl Runtime {
             raw_usage
         };
         let config = self.config.to_kernel_config().absorb.unwrap_or_default();
-        let plan = absorb::plan_absorb(tool_name, &cleaned, is_error, usage, &config);
+        // 预分配句柄：stub 里带上它，模型可用 `acp_decompress <handle>` 取回原文。
+        // 未命中吸收时该计数器不落盘（dirty 未置位），因此不会凭空消耗句柄。
+        let handle = crate::state::allocate_absorb_id(&mut self.state);
+        // 只有在原文仓库可用时才向模型承诺「可取回」；否则回退到旧措辞。
+        let reversible = crate::absorb_store::is_enabled();
+        let plan = absorb::plan_absorb(
+            tool_name,
+            &cleaned,
+            is_error,
+            usage,
+            &config,
+            &handle,
+            reversible,
+        );
 
         let (text, replacement) = match plan {
             Some(plan) => {
+                // 可逆吸收：原文落盘（失败则退化为旧行为——stub 仍带句柄，
+                // 但 `acp_decompress` 会如实报告“已过期/未找到”）。
+                crate::absorb_store::store(&plan.handle, &cleaned);
+                self.remember_absorbed(&plan, tool_name);
                 self.state.stats.absorbed_tokens += plan.reclaimed_tokens();
                 // 只标脏、不立即写盘：工具结果是每 turn 最热的回调，逐个原子写
                 // 会把磁盘打满。真正的落盘交给 `persist_if_dirty`（turn_stopping）。
@@ -203,6 +222,23 @@ impl Runtime {
         let id = format!("msg{}", self.next_message_seq);
         self.next_message_seq += 1;
         id
+    }
+
+    /// 记下一次可逆吸收，并在超过上限时淘汰最旧的条目（同时删掉其磁盘原文）。
+    ///
+    /// 上限存在的意义：句柄账本与磁盘文件会随会话无限增长，而真正会被回头
+    /// 查阅的巨型输出通常只有最近几十条。
+    fn remember_absorbed(&mut self, plan: &absorb::AbsorbPlan, tool_name: &str) {
+        self.state.absorbed_outputs.push(crate::types::AbsorbedOutput {
+            handle: plan.handle.clone(),
+            tool_name: tool_name.to_string(),
+            tokens: plan.original_tokens,
+            created_at: crate::time_now_ms(),
+        });
+        while self.state.absorbed_outputs.len() > crate::absorb_store::MAX_ENTRIES {
+            let evicted = self.state.absorbed_outputs.remove(0);
+            crate::absorb_store::remove(&evicted.handle);
+        }
     }
 
     /// 估算当前观测视图的 token 数。
@@ -344,6 +380,8 @@ impl Runtime {
         self.active_tool_calls.clear();
         self.next_message_seq = 1;
         self.state = crate::state::create_initial_state();
+        // 块账本连同可逆吸收的原文一起丢弃：`/acp reset` 的语义就是「忘掉一切」。
+        crate::absorb_store::clear();
         self.consecutive_nudges = 0;
         self.contract_injected = false;
         self.persist();
@@ -478,6 +516,55 @@ mod tests {
         assert_eq!(runtime.messages[0].text_str(), replacement);
         assert!(replacement.len() < big.len());
         assert!(runtime.state.stats.absorbed_tokens > 0);
+    }
+
+    /// 可逆吸收：stub 必须带句柄，句柄被登记进 `absorbed_outputs`，且原文能从
+    /// 仓库逐字取回（模型用 `acp_decompress <handle>`，不必重跑工具）。
+    #[test]
+    fn absorb_should_register_reversible_handle_in_stub() {
+        let dir = std::env::temp_dir().join(format!(
+            "phi-acp-reversible-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut runtime = absorb_runtime();
+        // 注意顺序：`absorb_runtime()` 内部的 `new_isolated()` 会关掉仓库，
+        // 因此必须在它之后再打开并指向临时目录。
+        crate::absorb_store::set_dir_override(Some(dir.clone()));
+        crate::absorb_store::set_enabled(true);
+        runtime.config.absorb_min_tool_tokens = 100;
+        let big = format!("HEAD{}TAIL", "x".repeat(40_000));
+        let replacement = runtime
+            .record_tool_result("c1", "bash", &big, false)
+            .expect("巨型输出应被吸收");
+
+        assert_eq!(runtime.state.absorbed_outputs.len(), 1);
+        let handle = runtime.state.absorbed_outputs[0].handle.clone();
+        assert!(handle.starts_with('a'), "句柄应形如 aN：{handle}");
+        assert!(replacement.contains(&handle), "stub 应引用句柄");
+        assert!(replacement.contains("acp_decompress"));
+        assert_eq!(runtime.state.absorbed_outputs[0].tool_name, "bash");
+        // 原文必须能从仓库逐字取回。
+        assert_eq!(crate::absorb_store::load(&handle).as_deref(), Some(big.as_str()));
+
+        crate::absorb_store::set_enabled(false);
+        crate::absorb_store::set_dir_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 原文仓库不可用时，stub 必须回退到旧措辞，不向模型承诺一个取不回来的句柄。
+    #[test]
+    fn absorb_without_store_should_not_promise_a_handle() {
+        let mut runtime = absorb_runtime();
+        runtime.config.absorb_min_tool_tokens = 100;
+        let big = format!("HEAD{}TAIL", "x".repeat(40_000));
+        let replacement = runtime
+            .record_tool_result("c1", "bash", &big, false)
+            .expect("巨型输出应被吸收");
+        assert!(!replacement.contains("acp_decompress"));
+        assert!(replacement.contains("re-run the tool"));
     }
 
     #[test]

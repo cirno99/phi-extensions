@@ -69,7 +69,7 @@ scripts/install.sh --debug  # 构建 debug
 | 入口 | 说明 |
 |---|---|
 | `compress` 工具 | 模型写摘要压缩一个 ref 区间；返回新建块账本（`bN=mAAAAA–mBBBBB`） |
-| `acp_decompress` / `acp_search` | 恢复被压缩内容 / 按相关度检索块 |
+| `acp_decompress` / `acp_search` | 恢复被压缩块（`bN`）或可逆吸收的原文（句柄 `aN`） / 按相关度检索块 |
 | `acp_status` | 使用率、块统计（含 absorbed）与当前可压缩范围 |
 | `acp_rule` | 记录永不压缩、每轮重注入的持久规则 |
 | `/acp status\|compress\|enable\|disable\|config …\|rules\|reset\|help` | 状态面板、手动压缩与配置 |
@@ -88,6 +88,25 @@ phi 没有消息历史 / 请求体重写钩子，摘要只落在扩展自己的 
 - 需要控制上下文大小 → 调 `absorb*`（`absorb-min-tokens` / `absorb-keep-prefix` /
   `absorb-keep-suffix` / `absorb-threshold-pct` / `absorb-always-above` / `absorb-exclude-tools`）。
 - 需要写摘要时 → `compress` 仍然有价值（模型可 `acp_search` / `acp_decompress`）。
+
+**可逆吸收（与两个原版对齐的关键修复）**：原版的 absorb 是**可逆**的——被吸收
+的工具输出仍留在宿主历史里，`decompress` 随时能取回，因此吸收只花上下文、不丢信息。
+phi 上扩展拿不到历史，只能在 `tool_result` 拦截时替换模型看到的那条消息，旧实现把
+中段直接丢弃（标记里写「re-run the tool if you need the missing middle」），模型回头
+需要细节时只能重跑 `read` / `build`——代价往往比省下的 token 还大，这正是「效果远不如
+原版」的核心原因之一。现在吸收改为可逆：原文落到 `state/absorbed/<handle>.txt`，stub
+里带上句柄（如 `a12`），模型用 `acp_decompress a12` 即可逐字取回（`absorb-store` 不可用
+时自动回退到旧措辞，不向模型承诺取不回来的句柄）。仓库上限 256 条，超出按插入顺序淘汰。
+
+**为什么 `compress` 在 phi 上压不掉上下文（与 `billion-context` 的根本差异）**：
+`billion-context` 是 HTTP 代理 / 原生插件，靠 `before_provider_request` 重写**真实请求体**；
+`acp-kernel` 的 `processTurn` 返回被 `prune` 过的消息数组，由宿主发往上游。两者都能把
+压缩后的历史**真正**从请求里删掉。phi 扩展协议只有 15 个钩子（`tool_call` / `tool_result` /
+`before_agent_start` / `user_input` / `turn_stopping` / 只读事件），**既无请求体重写、也拿不到
+消息历史**：内核只能在本扩展的「影子视图」上跑，`prune` 的结果被丢弃，块摘要只写进
+`state.json`。因此在 phi 上唯一能减少上游 token 的通道就是 `tool_result` 回写（absorb），
+`compress` 块只是可检索的账本。这不是移植遗漏，而是宿主能力边界——也是本扩展把
+`compress` 与 absorb 分开、并把默认回收策略压在 absorb 上的原因。
 
 **真正能让上下文变小的只有宿主压缩**：`internal/agent/engine.go` 在自然停轮后调
 `runCompact`，当 `contextTokens > context_window - 16384` 时保留约 20K 消息 + ≤13.1K 摘要、

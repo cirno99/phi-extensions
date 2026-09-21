@@ -11,6 +11,8 @@ pub fn create_initial_state() -> CompressionState {
         nudge: Default::default(),
         stats: Default::default(),
         absorbed: Vec::new(),
+        absorbed_outputs: Vec::new(),
+        next_absorb_id: 1,
         terminal_streak: None,
         rules: Vec::new(),
         next_rule_id: Some(1),
@@ -31,6 +33,24 @@ pub fn allocate_run_id(state: &mut CompressionState) -> String {
     let id = state.next_run_id.max(1);
     state.next_run_id = id + 1;
     format!("r{id}")
+}
+
+/// 分配一个可逆吸收句柄（`aN`）。
+pub fn allocate_absorb_id(state: &mut CompressionState) -> String {
+    let id = state.next_absorb_id.max(1);
+    state.next_absorb_id = id + 1;
+    format!("a{id}")
+}
+
+/// 按句柄查找可逆吸收记录。
+pub fn absorbed_output_by_handle<'a>(
+    state: &'a CompressionState,
+    handle: &str,
+) -> Option<&'a crate::types::AbsorbedOutput> {
+    state
+        .absorbed_outputs
+        .iter()
+        .find(|output| output.handle == handle)
 }
 
 /// 按 id 查找块。

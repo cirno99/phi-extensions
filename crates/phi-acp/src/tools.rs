@@ -157,18 +157,39 @@ fn register_decompress(ext: &mut phi::Extension, shared: Shared) {
     let schema = phi_ext_common::json::json!({
         "type": "object",
         "properties": {
-            "blockId": { "type": "string", "description": "Block id, e.g. b3" }
+            "blockId": {
+                "type": "string",
+                "description": "Compressed block id (b3) or absorb handle (a5)"
+            }
         },
         "required": ["blockId"]
     });
     let tool = phi::Tool::new(
         "acp_decompress",
-        "Restore the original content of a compressed block and mark it expanded \
-         (it will not be re-folded).",
+        "Restore original content. Accepts a compressed block id (`b3` — restores the block's \
+         source messages and marks it expanded) or an absorb handle (`a5` — restores a tool \
+         output that was elided with an `[acp absorb]` marker, verbatim).",
         phi::Schema::raw(phi_ext_common::json::to_vec(&schema).expect("schema")),
         move |args| {
             let parsed: DecompressArgs = parse_args(args)?;
             let mut guard = shared.borrow_mut();
+            // 可逆吸收句柄：直接从磁盘仓库取回逐字原文（不必重跑工具）。
+            if let Some(handle) = crate::absorb::parse_absorb_handle(&parsed.block_id) {
+                if crate::state::absorbed_output_by_handle(&guard.state, &handle).is_none() {
+                    return Err(format!(
+                        "unknown absorb handle: {handle} (it may have been evicted)"
+                    ));
+                }
+                let Some(content) = crate::absorb_store::load(&handle) else {
+                    return Err(format!(
+                        "absorbed output {handle} is no longer stored (evicted from disk)"
+                    ));
+                };
+                return Ok(phi::ToolResult {
+                    content: format!("restored {handle}\n\n{content}"),
+                    ..Default::default()
+                });
+            }
             let Some(block_id) = crate::decompress::parse_block_id_arg(&parsed.block_id) else {
                 return Err(format!("invalid block id: {}", parsed.block_id));
             };
@@ -255,14 +276,15 @@ fn register_status(ext: &mut phi::Extension, shared: Shared) {
             let report =
                 crate::compress::status(&guard.state, tokens, &guard.config.to_kernel_config());
             let mut lines = vec![format!(
-                "context: {:.1}% ({}/{} tokens, {source}) · active blocks {} · total {} · reclaimed {} tokens · absorbed {} tokens",
+                "context: {:.1}% ({}/{} tokens, {source}) · active blocks {} · total {} · reclaimed {} tokens · absorbed {} tokens ({} reversible handles)",
                 report.context_usage * 100.0,
                 report.token_count,
                 report.model_context_limit,
                 report.active_blocks,
                 report.total_blocks,
                 report.tokens_compressed,
-                guard.state.stats.absorbed_tokens
+                guard.state.stats.absorbed_tokens,
+                guard.state.absorbed_outputs.len()
             )];
             if let Some(nudge) = &outcome.nudge {
                 let ranges = crate::nudge::format_ranges(

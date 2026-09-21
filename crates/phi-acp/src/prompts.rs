@@ -36,7 +36,8 @@ dead ends (keep the lesson). It is a compression, not a rewrite: keep the summar
 fraction (well under half) of the content it replaces. Write it as history, not instructions \
 (\"TASK AS OF THIS \
 BLOCK: ...\"). `acp_search` / `acp_decompress` recover details. Large tool outputs may be \
-trimmed with an `[acp absorb]` marker — re-run the tool if you need the elided middle. \
+trimmed with an `[acp absorb]` marker + handle (e.g. `a12`); `acp_decompress a12` \
+restores it verbatim — don't re-run the tool. \
 Compress by need, not by percentage: compress genuinely consumed ranges, not short \
 conversations.";
 

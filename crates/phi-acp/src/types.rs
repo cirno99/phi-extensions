@@ -262,6 +262,26 @@ pub struct AbsorbRecord {
     pub created_at: u64,
 }
 
+/// 一次「可逆吸收」记录。
+///
+/// 与原版不同，phi 上的 absorb 是确定性的（不经过模型），因此这里额外保存
+/// 被吸收原文的**磁盘句柄**：stub 里带 `aN` 句柄，模型随时可 `acp_decompress aN`
+/// 取回原文，不必重跑工具。这正是原版 `decompress` 语义在 phi 上的落地——
+/// 让 absorb 从「有损截断」变成「可逆压缩」，信息不再丢失。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AbsorbedOutput {
+    /// 句柄（`aN`）。
+    pub handle: String,
+    /// 产生该输出的工具名。
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    /// 原文 token 数（估算）。
+    pub tokens: u64,
+    /// 创建时间（Unix 毫秒）。
+    #[serde(rename = "createdAt")]
+    pub created_at: u64,
+}
+
 /// 一条持久化规则（acp_rule）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuleRecord {
@@ -292,6 +312,12 @@ pub struct CompressionState {
     /// 吸收记录。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub absorbed: Vec<AbsorbRecord>,
+    /// 可逆吸收原文的账本（句柄 → 元数据；正文存在 `state/absorbed/<handle>.txt`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "absorbedOutputs")]
+    pub absorbed_outputs: Vec<AbsorbedOutput>,
+    /// 下一个 absorb 句柄计数器。
+    #[serde(default, rename = "nextAbsorbId")]
+    pub next_absorb_id: u64,
     /// 连续「贴顶」事件计数（终端逃逸信号）。
     #[serde(
         default,

@@ -23,6 +23,7 @@
 //! 与工具输出回写体现。详见 README。
 
 pub mod absorb;
+pub mod absorb_store;
 pub mod block_map;
 pub mod boundaries;
 pub mod commands;
