@@ -90,6 +90,15 @@ pub struct AcpConfig {
         rename = "absorbContextThresholdPct"
     )]
     pub absorb_context_threshold_pct: f64,
+    /// 使用率门槛之下仍强制吸收的 token 数（0 = 关闭）。
+    ///
+    /// 门槛只负责「先长后收」的波动，不应让**巨型**输出在低水位时完整留在
+    /// 历史里：一条 ≥ 该值的工具输出无论当前使用率多少都值得压成 stub。
+    #[serde(
+        default = "default_absorb_always_above_tokens",
+        rename = "absorbAlwaysAboveTokens"
+    )]
+    pub absorb_always_above_tokens: u64,
     /// absorb 排除的工具名模式（`*` 通配 / 子串）。
     #[serde(default, rename = "absorbExcludeTools")]
     pub absorb_exclude_tools: Vec<String>,
@@ -184,6 +193,17 @@ fn default_absorb_suffix_chars() -> usize {
 fn default_absorb_context_threshold_pct() -> f64 {
     0.30
 }
+/**
+ * 门槛之下仍强制吸收的 token 数（默认 2000）。
+ *
+ * 使用率门槛负责「先长后收」的波动，但它不能成为**巨型**输出的免死金牌：
+ * 早期会话（水位远低于门槛）或高门槛配置下，一条几万 token 的构建/测试日志
+ * 会完整留在历史里，直到水位涨到门槛才被处理。这里给一个「无论水位多低都吸」
+ * 的上界，把这类纯噪声尽早压成 stub。取 0 则关闭该例外。
+ */
+fn default_absorb_always_above_tokens() -> u64 {
+    2000
+}
 fn default_min_compress() -> usize {
     5000
 }
@@ -241,6 +261,7 @@ impl Default for AcpConfig {
             absorb_keep_prefix_chars: default_absorb_prefix_chars(),
             absorb_keep_suffix_chars: default_absorb_suffix_chars(),
             absorb_context_threshold_pct: default_absorb_context_threshold_pct(),
+            absorb_always_above_tokens: default_absorb_always_above_tokens(),
             absorb_exclude_tools: Vec::new(),
             use_host_tokens: true,
             nudge_growth_tokens: default_nudge_growth_tokens(),
@@ -284,6 +305,7 @@ impl AcpConfig {
             absorb.keep_prefix_chars = self.absorb_keep_prefix_chars;
             absorb.keep_suffix_chars = self.absorb_keep_suffix_chars;
             absorb.context_threshold_pct = self.absorb_context_threshold_pct;
+            absorb.always_above_tokens = self.absorb_always_above_tokens;
             absorb.exclude_tools = self.absorb_exclude_tools.clone();
         }
         config
@@ -366,6 +388,19 @@ mod tests {
         let kernel = config.to_kernel_config();
         assert_eq!(kernel.model_context_limit, 128_000);
         assert_eq!(kernel.compress.min_compress_range, 1000);
+    }
+
+    /// 扩展级的 absorb 旋钮必须完整透传到内核 `AbsorbConfig`（含巨型输出例外）。
+    #[test]
+    fn kernel_config_should_carry_absorb_overrides() {
+        let config = AcpConfig {
+            absorb_always_above_tokens: 1234,
+            absorb_context_threshold_pct: 0.42,
+            ..Default::default()
+        };
+        let absorb = config.to_kernel_config().absorb.expect("内核应带 absorb 配置");
+        assert_eq!(absorb.always_above_tokens, 1234);
+        assert_eq!(absorb.context_threshold_pct, 0.42);
     }
 
     /// 压力带提高到 0.90：日常振荡交给 absorb，提醒只在真接近上限时发。

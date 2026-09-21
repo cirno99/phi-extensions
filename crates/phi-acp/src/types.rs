@@ -488,6 +488,16 @@ pub struct AbsorbConfig {
     /// 保留的尾部字符数。
     #[serde(default = "default_absorb_suffix", rename = "keepSuffixChars")]
     pub keep_suffix_chars: usize,
+    /// 使用率门槛之下仍强制吸收的 token 数（0 = 关闭）。
+    ///
+    /// 门槛存在的意义是「先长后收」的波动，而不是让**巨型**输出在低水位时
+    /// 完整留在历史里：一条 ≥ 该值的输出无论当前使用率多少都值得压成 stub。
+    #[serde(default = "default_absorb_always_above", rename = "alwaysAboveTokens")]
+    pub always_above_tokens: u64,
+}
+
+fn default_absorb_always_above() -> u64 {
+    2000
 }
 
 fn default_absorb_prefix() -> usize {
@@ -508,6 +518,7 @@ impl Default for AbsorbConfig {
             exclude_tools: Vec::new(),
             keep_prefix_chars: default_absorb_prefix(),
             keep_suffix_chars: default_absorb_suffix(),
+            always_above_tokens: default_absorb_always_above(),
         }
     }
 }

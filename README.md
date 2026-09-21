@@ -86,7 +86,7 @@ phi 没有消息历史 / 请求体重写钩子，摘要只落在扩展自己的 
 提供 ref 索引与可检索的块账本。因此：
 
 - 需要控制上下文大小 → 调 `absorb*`（`absorb-min-tokens` / `absorb-keep-prefix` /
-  `absorb-keep-suffix` / `absorb-threshold-pct` / `absorb-exclude-tools`）。
+  `absorb-keep-suffix` / `absorb-threshold-pct` / `absorb-always-above` / `absorb-exclude-tools`）。
 - 需要写摘要时 → `compress` 仍然有价值（模型可 `acp_search` / `acp_decompress`）。
 
 **注入成本**：phi 会把 `SystemPromptAppend` 拼到**用户消息**后面并永久留在会话历史里
@@ -97,8 +97,20 @@ phi 没有消息历史 / 请求体重写钩子，摘要只落在扩展自己的 
 
 **压缩频率调优**：扩展层对内核提醒阈值做了更积极的覆盖（可用 `/acp config` 调整）——
 `growth-tokens=20000` / `min-growth-tokens=10000` / `min-context-pct=0.30` /
-`max-context-pct=0.65` / `tier2-trigger=3` / `tier3-trigger=6`。相比内核默认
+`max-context-pct=0.90` / `tier2-trigger=3` / `tier3-trigger=6`。相比内核默认
 （阈值 50k、两次提醒间新增 22.5k、使用率 45% 才提醒），压缩触发得更频繁。
+
+**`minCompressRange` 门槛的例外**：`compress` 默认拒绝字符数低于
+`min-compress`（5000）的范围，但**当请求已覆盖当前可压缩内容的 ≥ 80% 时例外放行**——
+此时「再合并更多消息」已凑不出多少，拒绝只会把可压缩内容永久搁置、上下文单调堆积。
+因此只压「可压缩全集中的一小片」（覆盖率 < 80%）才会被拦（提示语此时才准确）。
+阈值见 `compress::MIN_RANGE_COVERAGE_PCT`。
+
+**巨型输出的强制吸收**：`absorb` 的使用率门槛负责「先长后收」的波动，但它不应成为
+巨型输出的免死金牌——早期会话（水位远低于门槛）或高门槛配置下，一条几万 token 的
+构建 / 测试日志会完整留在历史里，直到水位涨到门槛才被处理。`absorb-always-above`
+（`absorbAlwaysAboveTokens`，默认 2000）让**任何** token 数 ≥ 该值的工具输出无论当前
+水位多低都立即压成 stub；取 0 关闭该例外，退回纯门槛行为。
 
 **与 pi 版的差异**：billion-context 在 pi 里是一个改基地址 + 改 `fetch` 的 HTTP
 代理（`before_provider_request` 重写请求体）。phi **没有请求体钩子、也拿不到

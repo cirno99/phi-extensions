@@ -443,11 +443,15 @@ mod tests {
     }
 
     /// 使用率低于门槛时不动手：这是「上下文先自然长大再回收」的波动前提。
+    ///
+    /// 关掉「巨型输出例外」以单独验证门槛本身（默认 2000 token 的例外会在
+    /// 低水位下也吸走这条 40K 字符 / ~10K token 的输出）。
     #[test]
     fn absorb_should_respect_context_threshold() {
         let mut runtime = absorb_runtime();
         runtime.config.absorb_min_tool_tokens = 100;
         runtime.config.absorb_context_threshold_pct = 0.5;
+        runtime.config.absorb_always_above_tokens = 0;
         runtime.config.model_context_limit = 1_000_000;
         let big = "x".repeat(40_000);
         // 观测视图很小 ⇒ 使用率远低于 50% ⇒ 不吸收。

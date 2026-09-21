@@ -177,9 +177,6 @@ pub fn plan_absorb(
     if is_never_absorbed(tool_name) || excluded_by_config(tool_name, config) {
         return None;
     }
-    if config.context_threshold_pct > 0.0 && context_usage < config.context_threshold_pct {
-        return None;
-    }
     if content.is_empty() || content.contains(ABSORB_MARKER) {
         return None;
     }
@@ -188,6 +185,14 @@ pub fn plan_absorb(
     let min_tokens = resolve_min_tokens(context_usage, config);
     if original_tokens < min_tokens {
         return None;
+    }
+    if config.context_threshold_pct > 0.0 && context_usage < config.context_threshold_pct {
+        // 门槛之下本应不动手（保留「先长后收」的波动），但**巨型**输出是例外：
+        // 一条 ≥ `always_above_tokens` 的结果无论当前水位多少，完整留在历史里
+        // 都是纯噪声，压成 stub 的信息损失远小于它占用的上下文。
+        if config.always_above_tokens == 0 || original_tokens < config.always_above_tokens {
+            return None;
+        }
     }
 
     let (keep_prefix, keep_suffix) = resolve_keep_window(context_usage, config);
@@ -273,12 +278,33 @@ mod tests {
     #[test]
     fn usage_gate_should_suppress_below_threshold() {
         let big = "x".repeat(60_000);
+        // 关掉「巨型输出例外」，单独验证使用率门槛本身。
         let gated = AbsorbConfig {
             context_threshold_pct: 0.5,
+            always_above_tokens: 0,
             ..config()
         };
         assert!(plan_absorb("bash", &big, false, 0.2, &gated).is_none());
         assert!(plan_absorb("bash", &big, false, 0.7, &gated).is_some());
+    }
+
+    /// 门槛之下，「巨型」输出仍应被吸收：否则早期会话 / 高门槛会话里，
+    /// 一条几万 token 的构建日志会完整留在历史中，直到水位涨到门槛才被处理。
+    #[test]
+    fn huge_output_should_be_absorbed_even_below_threshold() {
+        let gated = AbsorbConfig {
+            context_threshold_pct: 0.5,
+            always_above_tokens: 2000,
+            ..config()
+        };
+        // ~15000 token，远超 always_above_tokens：低水位也吸收。
+        let huge = "x".repeat(60_000);
+        assert!(plan_absorb("bash", &huge, false, 0.1, &gated).is_some());
+        // ~1000 token，低于 always_above_tokens：低水位不吸收。
+        let medium = "x".repeat(4_000);
+        assert!(plan_absorb("bash", &medium, false, 0.1, &gated).is_none());
+        // 越过门槛后，同一「中等」输出由常规门槛接管（min_tool_tokens 已降）。
+        assert!(plan_absorb("bash", &medium, false, 0.9, &gated).is_some());
     }
 
     #[test]

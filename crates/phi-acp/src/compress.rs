@@ -415,6 +415,13 @@ fn apply_single_range(
     Ok((compressed_tokens, warnings, consumed_block_ids))
 }
 
+/// `minCompressRange` 门槛的覆盖率例外阈值（百分比）。
+///
+/// 当请求范围覆盖了当前可压缩内容的 ≥ 该比例时，即使绝对字符数低于门槛也
+/// 放行：此时「再合并更多消息」已凑不出多少内容，拒绝只会把可压缩内容永久
+/// 搁置。取 100 则退化为旧的「必须覆盖全部」语义。
+pub const MIN_RANGE_COVERAGE_PCT: usize = 80;
+
 /// 应用一批压缩范围。
 pub fn apply_compression(
     ranges: &[CompressRangeSpec],
@@ -527,7 +534,28 @@ pub fn apply_compression(
                 }
             }
         }
-        if !has_block_boundary && total_chars < config.compress.min_compress_range {
+        // 请求范围是否已覆盖当前可压缩内容的**绝大部分**？
+        //
+        // 门槛的目的是防止把上下文切成一堆细碎的小块（每块都要写摘要、占 ref
+        // 账本）。但错误提示里的「Combine more messages into your range(s)」
+        // 只有在还剩**足够多**未纳入请求的可压缩内容时才成立：当请求已吃掉绝
+        // 大部分可压缩内容时，再合并也凑不出多少，拒绝只会把内容永久搁置、
+        // 上下文单调堆积，正是这个门槛最坏的表现。因此按覆盖率放行：覆盖
+        // ≥ MIN_RANGE_COVERAGE_PCT% 即视为「该压的都压了」。与
+        // `merge_ranges_to_threshold` 的同类回归一致（整批低于阈值也必须放行）。
+        let covers_most_compressible = total_chars >= config.compress.min_compress_range
+            || {
+                let available: usize =
+                    build_compressible_ranges(messages, &work, config, &protected)
+                        .compressible
+                        .iter()
+                        .map(|r| r.chars.unwrap_or((r.tokens * 4) as usize))
+                        .sum();
+                available > 0
+                    && total_chars.saturating_mul(100)
+                        >= available.saturating_mul(MIN_RANGE_COVERAGE_PCT)
+            };
+        if !has_block_boundary && !covers_most_compressible {
             let gate = if resolvable_count == 0 && consumed_indices.is_empty() && unknown_count > 0
             {
                 format!(
@@ -1021,5 +1049,90 @@ mod tests {
         let report = status(&state, 250, &config);
         assert!((report.context_usage - 0.25).abs() < 1e-9);
         assert_eq!(report.total_blocks, 0);
+    }
+
+    /// 回归：请求范围覆盖**全部**可压缩内容时，即便总字符数低于
+    /// `minCompressRange` 也必须放行——否则唯一可压缩的内容会被永久搁置，
+    /// 上下文只能单调堆积（对应「Total compressible content too small」）。
+    #[test]
+    fn apply_should_allow_full_coverage_below_min_compress_range() {
+        // 3609 字符 < 默认 minCompressRange(5000)，但它是当前全部可压缩内容。
+        let text = "x".repeat(3609);
+        let messages = vec![
+            CoreMessage::text("a", Role::Assistant, text),
+            user("u", "last user"),
+        ];
+        let state = with_refs(&messages);
+        let mut config = Config::default_for(200_000);
+        // 保护最后一条用户消息（m00002），使 m00001 成为**唯一**可压缩内容。
+        config.preserve_recent_messages = 1;
+        config.preserve_recent_tokens = 0;
+        assert!(config.compress.min_compress_range > 3609);
+        let spec = CompressRangeSpec {
+            start_ref: "m00001".into(),
+            end_ref: "m00001".into(),
+            summary: "A summary that is definitely long enough to satisfy the configured minimum summary length check for this regression test.".into(),
+            ..Default::default()
+        };
+        let outcome = apply_compression(&[spec], &messages, &state, &config, None);
+        assert_eq!(
+            outcome.result.blocks_created, 1,
+            "{:?}",
+            outcome.result.errors
+        );
+        assert!(outcome.result.errors.is_empty(), "{:?}", outcome.result.errors);
+    }
+
+    /// 覆盖率例外：请求范围吃掉绝大部分（≥80%）可压缩内容时也放行，
+    /// 即使绝对字符数低于门槛——剩下的那点再合并也凑不够门槛。
+    #[test]
+    fn apply_should_allow_high_coverage_below_min_compress_range() {
+        // a=4500 字符，b=400 字符：请求只含 a，但占可压缩内容的 ~92%。
+        let messages = vec![
+            CoreMessage::text("a", Role::Assistant, "x".repeat(4500)),
+            CoreMessage::text("b", Role::Assistant, "y".repeat(400)),
+            user("u", "last user"),
+        ];
+        let state = with_refs(&messages);
+        let mut config = Config::default_for(200_000);
+        config.preserve_recent_messages = 1;
+        config.preserve_recent_tokens = 0;
+        assert!(config.compress.min_compress_range > 4500);
+        let spec = CompressRangeSpec {
+            start_ref: "m00001".into(),
+            end_ref: "m00001".into(),
+            summary: "A summary that is definitely long enough to satisfy the configured minimum summary length check for this regression test.".into(),
+            ..Default::default()
+        };
+        let outcome = apply_compression(&[spec], &messages, &state, &config, None);
+        assert_eq!(
+            outcome.result.blocks_created, 1,
+            "{:?}",
+            outcome.result.errors
+        );
+    }
+
+    /// 反向：只请求全部可压缩内容中的一小片时，门槛仍要拦住。
+    #[test]
+    fn apply_should_still_gate_partial_slice_below_min_compress_range() {
+        let messages = vec![
+            CoreMessage::text("a", Role::Assistant, "x".repeat(4000)),
+            CoreMessage::text("b", Role::Assistant, "y".repeat(4000)),
+            user("u", "last user"),
+        ];
+        let state = with_refs(&messages);
+        let mut config = Config::default_for(200_000);
+        // 保护最后一条用户消息；a/b 均可压缩，只请求 a 属于「部分切片」。
+        config.preserve_recent_messages = 1;
+        config.preserve_recent_tokens = 0;
+        let spec = CompressRangeSpec {
+            start_ref: "m00001".into(),
+            end_ref: "m00001".into(),
+            summary: "A summary that is definitely long enough to satisfy the configured minimum summary length check for this regression test.".into(),
+            ..Default::default()
+        };
+        let outcome = apply_compression(&[spec], &messages, &state, &config, None);
+        assert_eq!(outcome.result.blocks_created, 0);
+        assert!(!outcome.result.errors.is_empty());
     }
 }
