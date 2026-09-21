@@ -196,6 +196,13 @@ fn register_events(ext: &mut phi::Extension, shared: Rc<std::cell::RefCell<Runti
         session.borrow_mut().on_session_start();
     });
 
+    // 宿主原生压缩后，观测视图里的旧消息已从上游请求里消失，必须重新同步，
+    // 否则 ref 索引 / 可压缩范围会指向已不存在的内容（见 `Runtime::on_host_compaction`）。
+    let compacted = shared.clone();
+    ext.subscribe(pxb::Event::SessionCompact, move |_ev| {
+        compacted.borrow_mut().on_host_compaction();
+    });
+
     // 会话切换 / 关闭时清掉 token 缓存：否则 `session_tokens` 会拿着上一个会话
     // 的文件偏移去读新会话的文件，使用率判断错位。
     let switching = shared;

@@ -32,7 +32,9 @@ a consumed range by calling the `compress` tool with `{startId, endId, summary}`
 (batch several in one `content: [...]` call). The summary becomes the ONLY record of that \
 range — keep full file paths with line numbers, exact signatures, exact error text, \
 decisions + rationale, constraints and magic values verbatim; drop logs, duplicate reads and \
-dead ends (keep the lesson). Write it as history, not instructions (\"TASK AS OF THIS \
+dead ends (keep the lesson). It is a compression, not a rewrite: keep the summary a small \
+fraction (well under half) of the content it replaces. Write it as history, not instructions \
+(\"TASK AS OF THIS \
 BLOCK: ...\"). `acp_search` / `acp_decompress` recover details. Large tool outputs may be \
 trimmed with an `[acp absorb]` marker — re-run the tool if you need the elided middle. \
 Compress by need, not by percentage: compress genuinely consumed ranges, not short \
@@ -81,7 +83,9 @@ PRIORITY — when the summary must be compact, preserve in this order:
 4. Conclusions and key findings.
 5. Lessons learned: what failed and why.
 
-Write dense, scannable bullets — not narrative prose. Every line must earn its place. Do not mimic the style of existing summaries in context; follow these rules.";
+Write dense, scannable bullets — not narrative prose. Every line must earn its place. Do not mimic the style of existing summaries in context; follow these rules.
+
+SIZE TARGET: the summary must be a small fraction (well under half) of the content it replaces — a summary nearly as large as the range is not compression, it is a rewrite. If it is too big, cut narrative and keep the load-bearing facts.";
 
 /// tier-2 蒸馏指令（短，随 nudge 携带）。
 ///

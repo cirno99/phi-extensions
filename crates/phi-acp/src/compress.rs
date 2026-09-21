@@ -212,6 +212,7 @@ fn validate_compression_range(
     spec: &CompressRangeSpec,
     direct_count: usize,
     consumed_count: usize,
+    content_tokens: u64,
     config: &Config,
 ) -> Result<(), String> {
     let summary = spec.summary.trim();
@@ -240,6 +241,24 @@ fn validate_compression_range(
             "Range contains no compressible messages — all are already covered by active blocks or protected."
                 .into(),
         );
+    }
+    // 摘要相对于被压内容的体积上限：防「把原文又抄一遍」的伪压缩。
+    // 与字符下限解耦——小范围的绝对体积很小，但比例同样必须显著小于 1。
+    if cfg.max_summary_ratio > 0.0 && content_tokens > 0 {
+        let ratio_cap = (content_tokens as f64 * cfg.max_summary_ratio).ceil() as u64;
+        // 下限：至少允许「最小摘要长度」对应的 token（按 4 字符/token 估）。
+        let floor = (cfg.min_summary_length as u64).div_ceil(4).max(32);
+        let cap = ratio_cap.max(floor);
+        let summary_tokens = crate::tokenize::count_tokens(summary);
+        if summary_tokens > cap {
+            return Err(format!(
+                "Summary too large for the compressed content ({} tokens, max {} = {}% of the {} tokens being compressed). This is not compression — write a denser summary: keep only paths, signatures, errors, decisions, constraints and exact values, drop the narrative.",
+                summary_tokens,
+                cap,
+                (cfg.max_summary_ratio * 100.0).round(),
+                content_tokens
+            ));
+        }
     }
     Ok(())
 }
@@ -360,13 +379,6 @@ fn apply_single_range(
         ));
     }
 
-    validate_compression_range(
-        input.spec,
-        direct_ids.len(),
-        consumed_block_ids.len(),
-        input.config,
-    )?;
-
     let mut compressed_tokens = 0u64;
     for id in &direct_ids {
         if let Some(message) = input.messages.iter().find(|m| &m.id == id) {
@@ -378,6 +390,14 @@ fn apply_single_range(
             compressed_tokens += crate::tokenize::count_tokens(&consumed.summary);
         }
     }
+
+    validate_compression_range(
+        input.spec,
+        direct_ids.len(),
+        consumed_block_ids.len(),
+        compressed_tokens,
+        input.config,
+    )?;
 
     let block_id = allocate_block_id(input.state);
     let block = CompressionBlock {
@@ -1105,6 +1125,48 @@ mod tests {
             ..Default::default()
         };
         let outcome = apply_compression(&[spec], &messages, &state, &config, None);
+        assert_eq!(
+            outcome.result.blocks_created, 1,
+            "{:?}",
+            outcome.result.errors
+        );
+    }
+
+    /// 摘要质量：摘要体积接近被压内容时应被拒绝（不是压缩，只是把原文又写一遍）。
+    #[test]
+    fn apply_should_reject_summary_larger_than_ratio_of_content() {
+        let messages = vec![
+            CoreMessage::text("a", Role::Assistant, "x".repeat(2000)),
+            CoreMessage::text("b", Role::Assistant, "x".repeat(2000)),
+            user("u", "last user"),
+        ];
+        let state = with_refs(&messages);
+        let mut config = Config::default_for(200_000);
+        config.preserve_recent_messages = 1;
+        config.preserve_recent_tokens = 0;
+        // 内容 ~1000 token，默认 ratio 0.5 ⇒ 摘要上限 ~500 token（~2000 字符）。
+        let bloated = CompressRangeSpec {
+            start_ref: "m00001".into(),
+            end_ref: "m00002".into(),
+            summary: "y".repeat(3000),
+            ..Default::default()
+        };
+        let outcome = apply_compression(&[bloated], &messages, &state, &config, None);
+        assert_eq!(outcome.result.blocks_created, 0);
+        assert!(
+            outcome.result.errors.iter().any(|e| e.contains("too large")),
+            "{:?}",
+            outcome.result.errors
+        );
+
+        // 同样范围、更精炼的摘要（~1000 字符）应通过。
+        let lean = CompressRangeSpec {
+            start_ref: "m00001".into(),
+            end_ref: "m00002".into(),
+            summary: "z".repeat(1000),
+            ..Default::default()
+        };
+        let outcome = apply_compression(&[lean], &messages, &state, &config, None);
         assert_eq!(
             outcome.result.blocks_created, 1,
             "{:?}",

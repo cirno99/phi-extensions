@@ -59,6 +59,12 @@ pub struct AcpConfig {
     /// 允许压缩的最小字符数。
     #[serde(default = "default_min_compress", rename = "minCompressRange")]
     pub min_compress_range: usize,
+    /// 摘要 token 数相对被压内容 token 数的上限比例（0 = 关闭）。
+    ///
+    /// 防止模型写出「和被压内容差不多大」的伪压缩摘要。见内核
+    /// [`crate::types::CompressValidationConfig::max_summary_ratio`]。
+    #[serde(default = "default_max_summary_ratio", rename = "maxSummaryRatio")]
+    pub max_summary_ratio: f64,
     /// 单会话最多连续提醒次数（防止死循环）。
     #[serde(default = "default_max_nudges", rename = "maxConsecutiveNudges")]
     pub max_consecutive_nudges: u32,
@@ -207,6 +213,10 @@ fn default_absorb_always_above_tokens() -> u64 {
 fn default_min_compress() -> usize {
     5000
 }
+/// 摘要 / 被压内容的 token 上限比例（默认 0.5）。
+fn default_max_summary_ratio() -> f64 {
+    0.5
+}
 fn default_max_nudges() -> u32 {
     5
 }
@@ -255,6 +265,7 @@ impl Default for AcpConfig {
             preserve_recent_tokens: default_preserve_tokens(),
             protected_tools: Vec::new(),
             min_compress_range: default_min_compress(),
+            max_summary_ratio: default_max_summary_ratio(),
             max_consecutive_nudges: default_max_nudges(),
             absorb_enabled: true,
             absorb_min_tool_tokens: default_absorb_min_tokens(),
@@ -292,6 +303,7 @@ impl AcpConfig {
         config.preserve_recent_tokens = self.preserve_recent_tokens;
         config.protected_tools = self.protected_tools.clone();
         config.compress.min_compress_range = self.min_compress_range;
+        config.compress.max_summary_ratio = self.max_summary_ratio;
         config.tiers.tier2_trigger = self.tier2_trigger;
         config.tiers.tier3_trigger = self.tier3_trigger;
         config.nudge.growth_floor = self.nudge_growth_tokens;
@@ -383,11 +395,13 @@ mod tests {
         let config = AcpConfig {
             model_context_limit: 128_000,
             min_compress_range: 1000,
+            max_summary_ratio: 0.33,
             ..Default::default()
         };
         let kernel = config.to_kernel_config();
         assert_eq!(kernel.model_context_limit, 128_000);
         assert_eq!(kernel.compress.min_compress_range, 1000);
+        assert_eq!(kernel.compress.max_summary_ratio, 0.33);
     }
 
     /// 扩展级的 absorb 旋钮必须完整透传到内核 `AbsorbConfig`（含巨型输出例外）。

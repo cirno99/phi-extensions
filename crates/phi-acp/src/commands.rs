@@ -11,7 +11,7 @@ const USAGE: &str = "📋 /acp 子命令：\n\
   status                       — 上下文使用率、块统计与可压缩范围（默认）\n\
   compress                     — 立即压缩当前可压缩范围（交由模型调用 compress 工具）\n\
   enable | disable             — 开关扩展\n\
-  config <key> <value>         — 设置配置（context-limit / render-tags / min-compress / host-tokens / growth-tokens / min-growth-tokens / min-context-pct / max-context-pct / tier2-trigger / tier3-trigger / absorb / absorb-min-tokens / absorb-keep-prefix / absorb-keep-suffix / absorb-threshold-pct / absorb-always-above / auto-nudge）\n\
+  config <key> <value>         — 设置配置（context-limit / render-tags / min-compress / max-summary-ratio / host-tokens / growth-tokens / min-growth-tokens / min-context-pct / max-context-pct / tier2-trigger / tier3-trigger / absorb / absorb-min-tokens / absorb-keep-prefix / absorb-keep-suffix / absorb-threshold-pct / absorb-always-above / auto-nudge）\n\
   rules                        — 列出持久规则\n\
   reset                        — 清空当前会话观测视图与压缩状态（需确认）\n\
   help                         — 显示本说明";
@@ -157,6 +157,13 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                                 Ok(v) => guard.config.min_compress_range = v,
                                 Err(_) => {
                                     ctx.notify("error", "min-compress 需要整数");
+                                    return Ok(());
+                                }
+                            },
+                            "max-summary-ratio" => match value.parse::<f64>() {
+                                Ok(v) => guard.config.max_summary_ratio = v,
+                                Err(_) => {
+                                    ctx.notify("error", "max-summary-ratio 需要小数（如 0.5，0 = 关闭）");
                                     return Ok(());
                                 }
                             },

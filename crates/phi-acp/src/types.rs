@@ -453,6 +453,17 @@ pub struct CompressValidationConfig {
     /// 摘要最小字符数。
     #[serde(rename = "minSummaryLength")]
     pub min_summary_length: usize,
+    /// 摘要 token 数相对被压缩内容 token 数的上限比例。
+    ///
+    /// 「压缩」的摘要不能和被压掉的内容差不多大——否则它不叫压缩，只是
+    /// 把原文又写了一遍。超过该比例直接拒绝，逼模型重新写一份更精炼的。
+    /// 0 表示关闭该校验。
+    #[serde(default = "default_max_summary_ratio", rename = "maxSummaryRatio")]
+    pub max_summary_ratio: f64,
+}
+
+fn default_max_summary_ratio() -> f64 {
+    0.5
 }
 
 impl Default for CompressValidationConfig {
@@ -461,6 +472,7 @@ impl Default for CompressValidationConfig {
             min_compress_range: 5000,
             max_summary_length: 20_000,
             min_summary_length: 50,
+            max_summary_ratio: default_max_summary_ratio(),
         }
     }
 }

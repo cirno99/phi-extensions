@@ -89,6 +89,15 @@ phi 没有消息历史 / 请求体重写钩子，摘要只落在扩展自己的 
   `absorb-keep-suffix` / `absorb-threshold-pct` / `absorb-always-above` / `absorb-exclude-tools`）。
 - 需要写摘要时 → `compress` 仍然有价值（模型可 `acp_search` / `acp_decompress`）。
 
+**真正能让上下文变小的只有宿主压缩**：`internal/agent/engine.go` 在自然停轮后调
+`runCompact`，当 `contextTokens > context_window - 16384` 时保留约 20K 消息 + ≤13.1K 摘要、
+其余历史丢弃。扩展拿不到它保留了哪些消息，但能收到 `session_compact` 事件。收到后
+（`Runtime::on_host_compaction`）清空自己的观测视图与 token 快照（旧消息已从上游请求里
+消失，继续留着会让 `/acp status` 的估算与可压缩范围指向已不存在的内容）、重新注入一次
+契约，但**保留块账本**——块摘要是被压内容的唯一记录，仍可 `acp_search` / `acp_decompress`。
+另外：`turn_stopping` 返回 `continue` 会**跳过**同轮的 `runCompact`，所以自动提醒默认关
+（`autoNudgeEnabled`）。
+
 **注入成本**：phi 会把 `SystemPromptAppend` 拼到**用户消息**后面并永久留在会话历史里
 （`ext/go/types.go`："appended to the user message"），`turn_stopping` 的转向消息同样
 被当作 user 消息 append。因此每轮注入的文本永远无法被压缩回收：契约改成每会话一次
@@ -99,6 +108,11 @@ phi 没有消息历史 / 请求体重写钩子，摘要只落在扩展自己的 
 `growth-tokens=20000` / `min-growth-tokens=10000` / `min-context-pct=0.30` /
 `max-context-pct=0.90` / `tier2-trigger=3` / `tier3-trigger=6`。相比内核默认
 （阈值 50k、两次提醒间新增 22.5k、使用率 45% 才提醒），压缩触发得更频繁。
+
+**摘要质量：相对体积上限**：`compress` 默认拒绝 token 数超过被压内容 50% 的摘要
+（`maxSummaryRatio`，`/acp config max-summary-ratio` 可调，0 = 关闭）——摘要和被压内容
+差不多大就不是压缩，只是把原文又写了一遍。此外 tier-1 规则里补了 SIZE TARGET，每会话
+注入的契约也点明「是压缩不是重写」。
 
 **`minCompressRange` 门槛的例外**：`compress` 默认拒绝字符数低于
 `min-compress`（5000）的范围，但**当请求已覆盖当前可压缩内容的 ≥ 80% 时例外放行**——

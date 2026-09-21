@@ -349,6 +349,34 @@ impl Runtime {
         self.persist();
     }
 
+    /// 宿主原生压缩（`runCompact`）后的重新同步。
+    ///
+    /// # 为什么必须处理
+    ///
+    /// 宿主压缩是 phi 上**唯一**能把上下文真正变小的事件：它把旧历史换成一段
+    /// 摘要、只保留最近若干消息（`internal/session/compaction` 的 `keepRecentTokens`）。
+    /// 扩展拿不到「保留了哪些消息」，但能确定一件事——**旧消息已从上游请求里
+    /// 消失**。而本扩展的观测视图此前一直把它们留在内存里，于是 `/acp status`
+    /// 的 token 估算、可压缩范围与 ref 索引都会系统性地指向已经不存在的内容，
+    /// 这正是「压缩效果差」的一个来源。
+    ///
+    /// # 做法
+    ///
+    /// 清空观测视图（旧消息已随宿主历史消失）与 token 快照，重新注入一次契约
+    /// （它可能已随被摘要的旧历史一起消失），但**保留块账本**——块摘要是被压
+    /// 内容的唯一记录，仍可 `acp_search` / `acp_decompress`。`next_message_seq`
+    /// 与 `message_refs` 不动：让新消息拿到递增的新 ref，避免与历史块里的旧 ref 撞号。
+    pub fn on_host_compaction(&mut self) {
+        self.messages.clear();
+        self.active_tool_calls.clear();
+        self.state.token_snapshot.clear();
+        // 契约可能已随被摘要的旧历史一起消失，下个 agent start 重新注入一次。
+        self.contract_injected = false;
+        self.reset_nudges();
+        self.mark_dirty();
+        self.persist_if_dirty();
+    }
+
     /// 当前活跃块覆盖的消息 id 集合。
     pub fn covered_ids(&self) -> BTreeSet<String> {
         crate::state::covered_message_ids(&self.state)
@@ -403,6 +431,32 @@ mod tests {
         // 新会话重新开放一次。
         runtime.on_session_start();
         assert_eq!(runtime.take_contract_injection("CONTRACT"), "CONTRACT");
+    }
+
+    /// 宿主压缩后必须重新同步：观测视图清空、契约重注入，但块账本保留。
+    #[test]
+    fn host_compaction_should_resync_view_but_keep_blocks() {
+        let mut runtime = Runtime::new_isolated();
+        runtime.reset_session();
+        runtime.record_user_input("hello");
+        // 块账本是压缩内容的唯一记录，压缩后仍应可检索。
+        runtime.state.blocks.push(crate::types::CompressionBlock {
+            block_id: "b1".into(),
+            summary: "kept summary".into(),
+            active: true,
+            ..Default::default()
+        });
+        runtime.take_contract_injection("CONTRACT");
+
+        runtime.on_host_compaction();
+
+        assert!(runtime.messages.is_empty(), "观测视图应清空");
+        assert_eq!(runtime.state.blocks.len(), 1, "块账本必须保留");
+        // 契约可重新注入（可能已随被摘要的旧历史消失）。
+        assert_eq!(runtime.take_contract_injection("CONTRACT"), "CONTRACT");
+        // ref 分配不回退：新消息的 id 继续递增，避免与历史块的旧 ref 撞号。
+        runtime.record_user_input("after compact");
+        assert_ne!(runtime.messages[0].id, "msg1");
     }
 
     #[test]
