@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use phi_ext_common::json::{Value, ValueAsArray, ValueAsScalar, ValueObjectAccess};
 
-use phi_ext_common::config::{load_strict, save_atomic, to_bool, ConfigError};
+use phi_ext_common::config::{load_strict, save_atomic, to_bool, to_int, ConfigError};
 use phi_ext_common::paths;
 
 /// 扩展名（同时作为 `~/.phi/extensions/<name>/` 的目录名）。
@@ -20,6 +20,9 @@ pub const EXTENSION_NAME: &str = "phi-deepseek-enhanced";
 pub const DEFAULT_CORE_TOOLS: [&str; 2] = ["bash", "str_replace_editor"];
 /// 默认「传输工具」：`xd://` 网关在 phi 中不可落地，仅保留 read/write 直呼开关。
 pub const DEFAULT_TRANSPORT_TOOLS: [&str; 2] = ["read", "write"];
+
+/// 每轮风格提醒允许的最大间隔轮数（防止手改配置写出病态值）。
+pub const MAX_ANCHOR_REPEAT_EVERY: i64 = 1000;
 
 /// 扩展配置。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +34,14 @@ pub struct Config {
     pub inject_anchor: bool,
     /// 上下文压缩后是否重新注入锚点（压缩会丢弃早先的用户消息）。
     pub reanchor_after_compact: bool,
+    /// 是否在首轮完整锚点之外，每轮再追加一段极简风格提醒。
+    ///
+    /// 默认开启：完整锚点只在首轮注入，随会话增长会被后续历史淹没，而模型
+    /// 对远离上下文尾部的指令遵循度衰减很快——这是「很少进入 We-need 思维链」
+    /// 的主因。每轮补一段贴尾短提醒能持续把风格拉回来。
+    pub anchor_repeat: bool,
+    /// 风格提醒的间隔轮数（`anchor_repeat` 生效时才有意义，1 = 每轮）。
+    pub anchor_repeat_every: u32,
     /// 是否剥离用户消息开头的「Today / current working directory」系统提醒。
     ///
     /// 默认关闭：当前 phi 宿主已不再注入这种提醒（实测所有会话的 user 消息
@@ -56,6 +67,8 @@ impl Default for Config {
             enabled: true,
             inject_anchor: true,
             reanchor_after_compact: true,
+            anchor_repeat: true,
+            anchor_repeat_every: 1,
             strip_date_cwd_reminder: false,
             minimal: false,
             transport: true,
@@ -70,10 +83,17 @@ impl Default for Config {
 
 impl Config {
     /// minimal 模式下允许直呼的全部工具名。
+    ///
+    /// 安全兜底：白名单为空时回落 [`DEFAULT_CORE_TOOLS`]。否则 `minimal` 会把
+    /// 模型的**所有**工具调用都拦掉，而模型没有任何工具可以自救——只能靠用户
+    /// 手改配置恢复，是最坏的死锁。
     pub fn allowed_direct_tools(&self) -> Vec<String> {
         let mut tools = self.core_tools.clone();
         if self.transport {
             tools.extend(self.transport_tools.iter().cloned());
+        }
+        if tools.is_empty() {
+            return DEFAULT_CORE_TOOLS.iter().map(|s| s.to_string()).collect();
         }
         tools
     }
@@ -103,6 +123,13 @@ pub fn normalize(raw: &Value) -> Config {
             raw.get("stripDateCwdReminder"),
             defaults.strip_date_cwd_reminder,
         ),
+        anchor_repeat: to_bool(raw.get("anchorRepeat"), defaults.anchor_repeat),
+        anchor_repeat_every: to_int(
+            raw.get("anchorRepeatEvery"),
+            1,
+            MAX_ANCHOR_REPEAT_EVERY,
+            defaults.anchor_repeat_every as i64,
+        ) as u32,
         minimal: to_bool(raw.get("minimal"), defaults.minimal),
         transport: to_bool(raw.get("transport"), defaults.transport),
         core_tools: strings(raw.get("coreTools"), &defaults.core_tools),
@@ -144,6 +171,8 @@ mod tests {
         assert!(config.enabled);
         assert!(config.inject_anchor);
         assert!(config.reanchor_after_compact);
+        assert!(config.anchor_repeat);
+        assert_eq!(config.anchor_repeat_every, 1);
         // 宿主已不再注入 Today/cwd 提醒，默认关闭以避免空转（见字段注释）。
         assert!(!config.strip_date_cwd_reminder);
         // Eternal Minimal 守卫在 phi 中默认关闭（见文件头注释）。
@@ -159,6 +188,8 @@ mod tests {
             "enabled": false,
             "injectAnchor": false,
             "reanchorAfterCompact": false,
+            "anchorRepeat": false,
+            "anchorRepeatEvery": 7,
             "stripDateCwdReminder": false,
             "minimal": true,
             "transport": false,
@@ -168,6 +199,8 @@ mod tests {
         assert!(!config.enabled);
         assert!(!config.inject_anchor);
         assert!(!config.reanchor_after_compact);
+        assert!(!config.anchor_repeat);
+        assert_eq!(config.anchor_repeat_every, 7);
         assert!(!config.strip_date_cwd_reminder);
         assert!(config.minimal);
         assert!(!config.transport);
@@ -197,6 +230,21 @@ mod tests {
             vec!["bash", "str_replace_editor", "read", "write"]
         );
         config.transport = false;
+        assert_eq!(
+            config.allowed_direct_tools(),
+            vec!["bash", "str_replace_editor"]
+        );
+    }
+
+    #[test]
+    fn empty_whitelist_should_fall_back_to_defaults() {
+        let config = Config {
+            minimal: true,
+            transport: false,
+            core_tools: Vec::new(),
+            transport_tools: Vec::new(),
+            ..Config::default()
+        };
         assert_eq!(
             config.allowed_direct_tools(),
             vec!["bash", "str_replace_editor"]

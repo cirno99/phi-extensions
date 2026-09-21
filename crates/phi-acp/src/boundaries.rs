@@ -260,6 +260,11 @@ fn resolve_anchor_index(
 }
 
 /// 被消费的锚点吸附到当前拥有其内容的活跃块。
+///
+/// 只有「真正的祖先」才算数：即通过消费下级块而**继承**了该内容的活跃块。
+/// 若某活跃块是**直接**压缩了这条消息的块，则调用方必须得到「已压缩——请改用
+/// 该块的 bN ref」的引导，而不是静默吸附——否则一次消息区间的重试会被悄悄变成
+/// 同层级的重复块（对应 TS 版的 `activeOwnerAnchor` 注释）。
 fn active_owner_anchor(
     state: &CompressionState,
     owned_ids: &[String],
@@ -288,6 +293,9 @@ fn active_owner_anchor(
 }
 
 /// 块通过消费其它块而继承的内容 id。
+///
+/// 由 `direct_block_ids` 推导（而非用 `effective − direct` 反推），这样导入或重建
+/// 出来的状态形态不会翻转「消费 vs 吸附」的判定。
 fn inherited_content_ids(
     state: &CompressionState,
     block: &CompressionBlock,
@@ -410,5 +418,72 @@ mod tests {
         let state = state_with_refs(&messages);
         let err = resolve_boundaries("m00099", "m00001", &messages, &state).unwrap_err();
         assert_eq!(err.kind, BoundaryErrorKind::Unknown);
+    }
+
+    fn block(
+        block_id: &str,
+        active: bool,
+        effective: &[&str],
+        children: &[&str],
+    ) -> CompressionBlock {
+        CompressionBlock {
+            block_id: block_id.into(),
+            active,
+            effective_message_ids: effective.iter().map(|s| s.to_string()).collect(),
+            direct_block_ids: children.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_boundaries_should_report_consumed_for_directly_consumed_message() {
+        // 原文 a/b 已被块 b1 **直接**消费。此时不能静默吸附到 b1，否则一次
+        // 消息区间的重试会被悄悄变成同层级的重复块；必须报 Consumed，让调用方
+        // 得到「已压缩——请改用 b1」的引导。
+        let messages = vec![
+            CoreMessage::text("acp_summary_b1", Role::System, "summary"),
+            CoreMessage::text("d", Role::User, "new"),
+        ];
+        let mut state = crate::state::create_initial_state();
+        state
+            .message_refs
+            .by_ref
+            .insert("m00001".into(), "a".into());
+        state
+            .message_refs
+            .by_ref
+            .insert("m00002".into(), "b".into());
+        state.blocks.push(block("b1", true, &["a", "b"], &[]));
+        let err = resolve_boundaries("m00001", "m00002", &messages, &state).unwrap_err();
+        assert_eq!(err.kind, BoundaryErrorKind::Consumed);
+    }
+
+    #[test]
+    fn resolve_boundaries_should_snap_consumed_message_to_ancestor_block() {
+        // a/b 先被 b1 直接消费，b1 又被更高层的 b2 消费（b2 通过 direct_block_ids
+        // 继承 a/b）。此时 b1 已失活，边界应吸附到真正拥有内容的祖先 b2。
+        let messages = vec![
+            CoreMessage::text("acp_summary_b2", Role::System, "summary"),
+            CoreMessage::text("d", Role::User, "new"),
+        ];
+        let mut state = crate::state::create_initial_state();
+        state
+            .message_refs
+            .by_ref
+            .insert("m00001".into(), "a".into());
+        state
+            .message_refs
+            .by_ref
+            .insert("m00002".into(), "b".into());
+        state.blocks.push(block("b1", false, &["a", "b"], &[]));
+        state.blocks.push(block("b2", true, &["a", "b"], &["b1"]));
+        let range = resolve_boundaries("m00001", "m00002", &messages, &state)
+            .expect("ancestor block should own the consumed content");
+        assert_eq!(range.start_index, 0);
+        assert_eq!(range.end_index, 0);
+        assert!(range
+            .snapped_boundaries
+            .iter()
+            .any(|s| s.contains("already compressed")));
     }
 }

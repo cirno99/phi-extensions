@@ -22,7 +22,11 @@ pub const EXTENSION_NAME: &str = "phi-acp";
 /// absorb 尚未成为主要回收通道的时期——它会直接关掉 phi 上**唯一**能真正
 /// 删 token 的机制，让上下文单调堆积。因此升级时按版本号一次性重写这部分
 /// 默认值；此后用户再手动 `/acp config absorb false` 会被尊重。
-pub const CURRENT_CONFIG_VERSION: u32 = 2;
+///
+/// v3：把 v2 偏保守的 absorb 默认（门槛 0.30 / 强制吸收 2000 / 最小 500）
+/// 升到更积极的取值（0.20 / 1500 / 400）——旧门槛下多数会话水位长期低于
+/// 0.30，absorb 几乎从不触发。仅当字段仍等于旧默认时迁移，用户显式改过的值保留。
+pub const CURRENT_CONFIG_VERSION: u32 = 3;
 
 /// 配置架构版本。
 fn default_config_version() -> u32 {
@@ -175,12 +179,13 @@ fn default_preserve_tokens() -> u64 {
  * absorb 默认门槛。
  *
  * 实测：工具输出占一个编码会话上下文的 70–80%（样本：261 条工具结果共
- * 163_921 token；130 条共 113_684 token）。`min_tool_tokens` 定在 500 而非
+ * 163_921 token；130 条共 113_684 token）。`min_tool_tokens` 定在 400 而非
  * 1000，保留窗口缩到 1500 / 500 字符后，同一批数据的可回收量从 ~69K 升到 ~81K。
- * 保留的头/尾仍足以定位错误行与结论，中段由标记提示「按需重跑」。
+ * 保留的头/尾仍足以定位错误行与结论，中段由标记提示「按需重跑」（可逆吸收下
+ * 还能用 `acp_decompress` 逐字取回）。
  */
 fn default_absorb_min_tokens() -> u64 {
-    500
+    400
 }
 fn default_absorb_prefix_chars() -> usize {
     1500
@@ -190,25 +195,31 @@ fn default_absorb_suffix_chars() -> usize {
 }
 
 /**
- * absorb 的使用率门槛（默认 0.30）。
+ * absorb 的使用率门槛（默认 0.20）。
  *
- * 这是让「上下文在 50K～～200K 之间波动」的关键旋钮：低于门槛时不动手，
+ * 这是让「上下文在 40K～～200K 之间波动」的关键旋钮：低于门槛时不动手，
  * 上下文自然长大；越过门槛后新工具输出被压成 stub，使用率回落，
  * 回落过低后重新暂停。取 `0` 则从第一轮就无差别吸收，上下文会一直偏小。
+ *
+ * 原默认 0.30 在多数会话里几乎从不触发（水位长期低于 30%），是「absorb 感觉
+ * 没效果」的主因；降到 0.20 让常规会话也能持续回收。
  */
 fn default_absorb_context_threshold_pct() -> f64 {
-    0.30
+    0.20
 }
 /**
- * 门槛之下仍强制吸收的 token 数（默认 2000）。
+ * 门槛之下仍强制吸收的 token 数（默认 1500）。
  *
  * 使用率门槛负责「先长后收」的波动，但它不能成为**巨型**输出的免死金牌：
  * 早期会话（水位远低于门槛）或高门槛配置下，一条几万 token 的构建/测试日志
  * 会完整留在历史里，直到水位涨到门槛才被处理。这里给一个「无论水位多低都吸」
  * 的上界，把这类纯噪声尽早压成 stub。取 0 则关闭该例外。
+ *
+ * 原默认 2000 偏高：一条 1500–2000 token 的输出在低水位时会完整留下，
+ * 而它已足够大、压成 stub 的信息损失远小于占用。降到 1500。
  */
 fn default_absorb_always_above_tokens() -> u64 {
-    2000
+    1500
 }
 fn default_min_compress() -> usize {
     5000
@@ -329,9 +340,27 @@ pub fn config_path() -> PathBuf {
     paths::extension_config_path(EXTENSION_NAME)
 }
 
-/// 压缩状态文件路径。
+/// 压缩状态文件路径（**旧版全局单文件**，仅用于迁移）。
 pub fn state_path() -> PathBuf {
     paths::extension_state_dir(EXTENSION_NAME).join("state.json")
+}
+
+/// 每会话状态目录：`state/sessions/`。
+///
+/// 对应上游 `billion-context` 的 `sessionsDir()`（`src/paths.ts`：*"Sessions dir:
+/// one JSON file per session"*）。原项目按会话 id 分文件存压缩状态，本扩展早先
+/// 只有一个全局 `state.json`——于是**新会话会继承上一个会话的 ref 索引与块账本**：
+/// `acp_status` 报出宿主机历史里根本不存在的可压缩范围，模型照着压缩就必然
+/// 「失败 / 无作用」。ref 是**每会话**的（契约里明说），状态文件也必须每会话。
+pub fn sessions_state_dir() -> PathBuf {
+    paths::extension_state_dir(EXTENSION_NAME).join("sessions")
+}
+
+/// 指定会话的状态文件路径。
+///
+/// `key` 已经过 [`crate::session::sanitize_key`] 净化，不含路径分隔符。
+pub fn session_state_path(key: &str) -> PathBuf {
+    sessions_state_dir().join(format!("{key}.json"))
 }
 
 /// 加载配置，并做一次性的架构迁移。
@@ -352,8 +381,10 @@ pub fn load() -> AcpConfig {
 
 /// 把旧版本配置迁移到当前架构。返回（迁移后的配置，是否发生改动）。
 ///
-/// 目前只有 1 → 2：打开 absorb、补上使用率门槛。这里的「旧值」判定不带歧义
+/// v0 → v2：打开 absorb、补上使用率门槛。这里的「旧值」判定不带歧义
 /// ——absorb 在 v1 的默认值是关闭，而开启它是本次修复的核心。
+/// v2 → v3：把仍等于旧默认的 absorb 门槛（0.30 / 2000 / 500）升到新默认
+/// （0.20 / 1500 / 400）。
 fn migrate(mut config: AcpConfig) -> (AcpConfig, bool) {
     if config.config_version >= CURRENT_CONFIG_VERSION {
         return (config, false);
@@ -365,6 +396,19 @@ fn migrate(mut config: AcpConfig) -> (AcpConfig, bool) {
         // 换成默认门槛后「先长后收」的波动才成立。
         if config.absorb_context_threshold_pct <= 0.0 {
             config.absorb_context_threshold_pct = default_absorb_context_threshold_pct();
+        }
+    }
+    if config.config_version < 3 {
+        // v2 的 absorb 默认偏保守，多数会话水位长期低于 0.30，absorb 几乎从不触发。
+        // 仅在字段仍等于旧默认时升级；用户显式改过的值（如 0.45）保持不动。
+        if (config.absorb_context_threshold_pct - 0.30).abs() < f64::EPSILON {
+            config.absorb_context_threshold_pct = default_absorb_context_threshold_pct();
+        }
+        if config.absorb_always_above_tokens == 2000 {
+            config.absorb_always_above_tokens = default_absorb_always_above_tokens();
+        }
+        if config.absorb_min_tool_tokens == 500 {
+            config.absorb_min_tool_tokens = default_absorb_min_tokens();
         }
     }
     config.config_version = CURRENT_CONFIG_VERSION;
@@ -412,7 +456,10 @@ mod tests {
             absorb_context_threshold_pct: 0.42,
             ..Default::default()
         };
-        let absorb = config.to_kernel_config().absorb.expect("内核应带 absorb 配置");
+        let absorb = config
+            .to_kernel_config()
+            .absorb
+            .expect("内核应带 absorb 配置");
         assert_eq!(absorb.always_above_tokens, 1234);
         assert_eq!(absorb.context_threshold_pct, 0.42);
     }
@@ -422,7 +469,7 @@ mod tests {
     fn absorb_defaults_should_regulate_into_a_band() {
         let config = AcpConfig::default();
         // 使用率门槛让「先长后收」成立。
-        assert_eq!(config.absorb_context_threshold_pct, 0.30);
+        assert_eq!(config.absorb_context_threshold_pct, 0.20);
         assert!(config.absorb_enabled);
         // 门槛比压力带低，中间才有波动空间。
         assert!(config.absorb_context_threshold_pct < config.nudge_max_context_pct);
@@ -446,7 +493,7 @@ mod tests {
         assert!(changed, "旧配置应被迁移");
         assert!(migrated.absorb_enabled, "旧配置必须打开 absorb");
         // 无门槛的旧 absorb 会把上下文钉在低水位，迁移要补上门槛。
-        assert_eq!(migrated.absorb_context_threshold_pct, 0.30);
+        assert_eq!(migrated.absorb_context_threshold_pct, 0.20);
         assert_eq!(migrated.config_version, CURRENT_CONFIG_VERSION);
     }
 
@@ -476,5 +523,36 @@ mod tests {
         let (migrated, _) = migrate(legacy);
         assert_eq!(migrated.model_context_limit, 123_456);
         assert_eq!(migrated.absorb_min_tool_tokens, 77);
+        assert_eq!(migrated.absorb_min_tool_tokens, 77);
+    }
+
+    /// v2 → v3：仍等于旧默认的 absorb 门槛升到新默认；显式改过的值保留。
+    #[test]
+    fn migration_should_raise_stale_absorb_defaults() {
+        let v2 = AcpConfig {
+            config_version: 2,
+            absorb_context_threshold_pct: 0.30,
+            absorb_always_above_tokens: 2000,
+            absorb_min_tool_tokens: 500,
+            ..Default::default()
+        };
+        let (migrated, changed) = migrate(v2);
+        assert!(changed);
+        assert_eq!(migrated.config_version, CURRENT_CONFIG_VERSION);
+        assert_eq!(migrated.absorb_context_threshold_pct, 0.20);
+        assert_eq!(migrated.absorb_always_above_tokens, 1500);
+        assert_eq!(migrated.absorb_min_tool_tokens, 400);
+
+        let custom = AcpConfig {
+            config_version: 2,
+            absorb_context_threshold_pct: 0.45,
+            absorb_always_above_tokens: 9999,
+            absorb_min_tool_tokens: 123,
+            ..Default::default()
+        };
+        let (kept, _) = migrate(custom);
+        assert_eq!(kept.absorb_context_threshold_pct, 0.45);
+        assert_eq!(kept.absorb_always_above_tokens, 9999);
+        assert_eq!(kept.absorb_min_tool_tokens, 123);
     }
 }

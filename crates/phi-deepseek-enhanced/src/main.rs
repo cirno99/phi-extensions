@@ -8,7 +8,9 @@
 // - 注册 `str_replace_editor` 工具            → `register_tool`，等价。
 // - `session_start` 里按模型启用最小呈现       → `subscribe(SessionStart)`。
 // - `before_agent_start` 注入锚点 / 最小系统提示 → `on_before_agent_start`
-//   的 `system_prompt_append`（宿主会把它并进当前用户消息）。
+//   的 `system_prompt_append`（宿主会把它并进当前用户消息末尾）。该钩子
+//   **每轮用户消息都会触发一次**，所以首轮注入完整锚点、后续轮次按间隔
+//   追加极简风格提醒，避免锚点被历史淹没后失效。
 // - `context` 过滤自动上下文 + 隐藏锚点         → 无对应（拿不到消息历史）。
 // - `tool_call` 阻止高阶工具直呼                → `on_tool_call` 返回 `Block`，等价。
 //
@@ -72,6 +74,9 @@ fn strip_date_cwd_text(content: &str) -> Option<String> {
 fn register_before_agent_start(ext: &mut phi::Extension, shared: Shared) {
     ext.on_before_agent_start(move |ev| {
         let mut guard = shared.borrow_mut();
+        // 每轮重载配置：`/deepseek minimal on|off` 等中途变更必须立刻生效，
+        // 否则守卫状态与锚点里描述的工具集会在本会话内长期不一致。
+        guard.reload_config();
         if !guard.config.enabled {
             return None;
         }
@@ -85,12 +90,18 @@ fn register_before_agent_start(ext: &mut phi::Extension, shared: Shared) {
             }
         }
 
-        if guard.config.inject_anchor
-            && !anchor::contains_anchor(&ev.prompt)
-            && guard.take_anchor()
-        {
-            result.system_prompt_append = guard.anchor_prompt();
-            changed = true;
+        guard.begin_turn();
+
+        match guard.anchor_injection(&ev.prompt) {
+            state::AnchorInjection::Full => {
+                result.system_prompt_append = guard.anchor_prompt();
+                changed = true;
+            }
+            state::AnchorInjection::Reminder => {
+                result.system_prompt_append = guard.anchor_reminder();
+                changed = true;
+            }
+            state::AnchorInjection::None => {}
         }
 
         if changed {
@@ -101,6 +112,42 @@ fn register_before_agent_start(ext: &mut phi::Extension, shared: Shared) {
     });
 }
 
+/// 非核心工具 → 等价的替代用法。
+///
+/// 拦截如果只说「不允许」，模型往往会原样重试；给出可直接照做的替代命令，
+/// 才能把「试 → 被拒 → 重试」压成一次。工具名取自 phi 宿主内建工具清单。
+fn substitute_hint(tool: &str) -> &'static str {
+    match tool {
+        "read" => "改用 `str_replace_editor` 的 `view` 命令，或 `bash` 的 `cat` / `sed -n`",
+        "write" => "改用 `str_replace_editor` 的 `create` / `insert` / `str_replace` 命令",
+        "edit" => "改用 `str_replace_editor` 的 `str_replace` 命令",
+        "grep" => "改用 `bash` 执行 `rg -n <pattern>`",
+        "find" => "改用 `bash` 执行 `rg --files` 或 `fd`",
+        "ls" => "改用 `bash` 执行 `ls`",
+        "agent_spawn" | "agent_list" | "agent_wait" | "agent_cancel" => {
+            "本会话不允许直呼子代理工具，请用 `bash` 完成"
+        }
+        "mcp_list" | "mcp_inspect" | "mcp_call" => {
+            "本会话不允许直呼 MCP 工具，请用 `bash` 完成"
+        }
+        _ => "请改用允许的工具完成该操作",
+    }
+}
+
+/// 组装拦截原因：说明白名单、给出替代用法，并在「传输工具被显式关闭」时
+/// 额外提示如何放行（否则用户会误以为 read/write 坏了）。
+fn block_reason(tool: &str, allowed: &[String], config: &config::Config) -> String {
+    let mut reason = format!(
+        "Eternal Minimal 阻止对 {tool} 的直接调用；本会话只允许直呼：{}。{}。",
+        allowed.join(", "),
+        substitute_hint(tool)
+    );
+    if !config.transport && config.transport_tools.iter().any(|name| name == tool) {
+        reason.push_str("\n提示：`transport` 已关闭；`/deepseek transport on` 可放行 read/write。");
+    }
+    reason
+}
+
 /// Eternal Minimal 运行时守卫：阻止对非核心工具的直接调用。
 fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
     ext.on_tool_call(move |ev| {
@@ -109,17 +156,16 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
             return None;
         }
         let allowed = guard.config.allowed_direct_tools();
-        if allowed.iter().any(|name| name == &ev.tool_name) {
+        // 兜底：白名单为空时不拦任何调用（`allowed_direct_tools` 已保证非空，
+        // 这里是最后一道保险，避免把整个会话锁死）。
+        if allowed.is_empty() || allowed.iter().any(|name| name == &ev.tool_name) {
             return None;
         }
         guard.blocked_calls += 1;
+        let reason = block_reason(&ev.tool_name, &allowed, &guard.config);
         Some(phi::ToolCallResult {
             block: true,
-            reason: format!(
-                "Eternal Minimal 阻止对 {} 的直接调用；本会话只允许直呼：{}。请改用允许的工具完成该操作。",
-                ev.tool_name,
-                allowed.join(", ")
-            ),
+            reason,
             ..Default::default()
         })
     });
@@ -162,5 +208,28 @@ mod tests {
     #[test]
     fn strip_should_ignore_plain_prompts() {
         assert_eq!(strip_date_cwd_text("hello"), None);
+    }
+
+    #[test]
+    fn block_reason_should_offer_a_substitute() {
+        let allowed = vec!["bash".to_string(), "str_replace_editor".to_string()];
+        let config = config::Config::default();
+        let reason = block_reason("read", &allowed, &config);
+        assert!(reason.contains("bash, str_replace_editor"), "{reason}");
+        assert!(reason.contains("str_replace_editor"), "{reason}");
+        assert!(block_reason("grep", &allowed, &config).contains("rg"));
+    }
+
+    #[test]
+    fn block_reason_should_explain_disabled_transport() {
+        let allowed = vec!["bash".to_string()];
+        let config = config::Config {
+            transport: false,
+            ..config::Config::default()
+        };
+        // read 在传输名单里但被显式关闭 → 要提示如何放行。
+        assert!(block_reason("read", &allowed, &config).contains("/deepseek transport on"));
+        // 不在传输名单里的工具不该出现这段提示。
+        assert!(!block_reason("grep", &allowed, &config).contains("transport"));
     }
 }

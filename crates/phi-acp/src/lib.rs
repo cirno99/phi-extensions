@@ -10,7 +10,7 @@
 //! 内核（纯函数、可完整单测）：
 //! [`types`] · [`config`] · [`state`] · [`refs`] · [`tokenize`] · [`protected`] ·
 //! [`boundaries`] · [`prune`] · [`block_map`] · [`recommend`] · [`nudge`] ·
-//! [`truncate`] · [`decompress`] · [`render`] · [`prompts`] · [`compress`]。
+//! [`truncate`] · [`decompress`] · [`search`] · [`render`] · [`prompts`] · [`compress`]。
 //!
 //! 扩展外壳：[`runtime`] · [`tools`] · [`commands`] · [`absorb`]。
 //!
@@ -37,7 +37,10 @@ pub mod prune;
 pub mod recommend;
 pub mod refs;
 pub mod render;
+pub mod rules;
 pub mod runtime;
+pub mod search;
+pub mod session;
 pub mod session_tokens;
 pub mod state;
 pub mod tokenize;

@@ -103,23 +103,16 @@ fn register_tool_result(ext: &mut phi::Extension, shared: Rc<std::cell::RefCell<
 fn register_before_agent_start(ext: &mut phi::Extension, shared: Rc<std::cell::RefCell<Runtime>>) {
     ext.on_before_agent_start(move |_ev| {
         let prompts = Prompts::default();
-        // 契约每会话只发一次；持久规则随每次摘录（它们本就是用户显式要求常驻的）。
-        let (contract, rules) = {
+        let append = {
             let mut guard = shared.borrow_mut();
             if !guard.config.enabled {
                 return None;
             }
-            let contract = guard.take_contract_injection(&prompts.contract);
-            let rules = tools::format_rules_for_prompt(&guard.state);
-            (contract, rules)
+            // 契约每会话一次；规则只在「内容变化 / 新会话 / 宿主压缩后」重发——
+            // 两者都会被拼进用户消息并永久留在历史里，每轮重发就是每轮永久 +N token。
+            let rules = phi_acp::rules::format_rules_for_prompt(&guard.state);
+            guard.take_prompt_append(&prompts.contract, &rules)
         };
-        let mut append = contract;
-        if !rules.is_empty() {
-            if !append.is_empty() {
-                append.push_str("\n\n");
-            }
-            append.push_str(&rules);
-        }
         if append.is_empty() {
             return None;
         }
@@ -191,9 +184,15 @@ fn register_turn_stopping(ext: &mut phi::Extension, shared: Rc<std::cell::RefCel
 /// 生命周期事件。
 fn register_events(ext: &mut phi::Extension, shared: Rc<std::cell::RefCell<Runtime>>) {
     let session = shared.clone();
-    ext.subscribe(pxb::Event::SessionStart, move |_ev| {
-        // 新会话：契约需重新注入一次（新会话历史里还没有）。
-        session.borrow_mut().on_session_start();
+    ext.subscribe(pxb::Event::SessionStart, move |ev| {
+        // 新会话：契约需重新注入一次（新会话历史里还没有）；若会话身份变了
+        // 还要换账本——否则新会话会继承上一个会话的 ref 索引与块账本，
+        // `acp_status` 报出的可压缩范围在宿主机历史里根本不存在。
+        // `ev.reason` 取 `startup` / `resume` / `new`（`controller.go` 的
+        // `emitSessionStart`）；`ev.previous_session_id` 是刚离开的会话。
+        session
+            .borrow_mut()
+            .on_session_start(&ev.reason, &ev.previous_session_id);
     });
 
     // 宿主原生压缩后，观测视图里的旧消息已从上游请求里消失，必须重新同步，
@@ -204,10 +203,12 @@ fn register_events(ext: &mut phi::Extension, shared: Rc<std::cell::RefCell<Runti
     });
 
     // 会话切换 / 关闭时清掉 token 缓存：否则 `session_tokens` 会拿着上一个会话
-    // 的文件偏移去读新会话的文件，使用率判断错位。
+    // 的文件偏移去读新会话的文件，使用率判断错位。顺带释放检索特征缓存
+    // （对应上游 `clearDocFeatures`，可选：字符上限本身已经限制了它）。
     let switching = shared;
     ext.subscribe(pxb::Event::SessionShutdown, move |_ev| {
         phi_acp::session_tokens::reset_cache();
+        phi_acp::search::doc_cache::clear_doc_features();
         switching.borrow_mut().reset_nudges();
     });
 }

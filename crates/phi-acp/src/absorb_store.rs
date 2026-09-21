@@ -55,12 +55,42 @@ pub const MAX_ENTRIES: usize = 256;
 /// 扩展名（也是数据目录名），与 `config::EXTENSION_NAME` 保持一致。
 const EXTENSION_NAME: &str = "phi-acp";
 
-/// 原文仓库目录：`<phi_home>/extensions/phi-acp/state/absorbed`。
+// 会话键：可逆吸收的原文**按会话**分目录存放。
+//
+// # 为什么必须按会话分
+//
+// 句柄编号（`next_absorb_id`）是 [`crate::state::CompressionState`] 的一部分，
+// 而状态自本版本起按会话分文件（见 [`crate::session`]）。若原文仍共用一个目录，
+// 两个会话的 `a1` 会写到**同一个文件**上：后写入的静默覆盖先写入的，
+// `acp_decompress a1` 于是返回**别的会话的内容**——比找不到更糟。
+//
+// 键未知（`SessionStart` 前、或解析不出会话文件）时退回旧的共享目录，
+// 保证功能不因此失效；键一旦确定（首个 turn 结束前必然确定）就切到会话目录。
+thread_local! {
+    static SESSION_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// 设置当前会话键（由 [`crate::runtime::Runtime`] 维护）。
+pub fn set_session_key(key: Option<String>) {
+    SESSION_KEY.with(|slot| *slot.borrow_mut() = key);
+}
+
+/// 当前会话键。
+pub fn session_key() -> Option<String> {
+    SESSION_KEY.with(|slot| slot.borrow().clone())
+}
+
+/// 原文仓库目录：`<phi_home>/extensions/phi-acp/state/absorbed[ /<会话键>]`。
 pub fn dir() -> PathBuf {
-    if let Some(overridden) = DIR_OVERRIDE.with(|slot| slot.borrow().clone()) {
-        return overridden;
+    // 单测的目录覆盖充当**基目录**（而不是直接返回），这样按会话分目录的逻辑在
+    // 单测里同样生效，同时仍然不会碰到用户真实目录。
+    let base = DIR_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(|| paths::extension_state_dir(EXTENSION_NAME).join("absorbed"));
+    match session_key() {
+        Some(key) => base.join(key),
+        None => base,
     }
-    paths::extension_state_dir(EXTENSION_NAME).join("absorbed")
 }
 
 fn path_for(handle: &str) -> PathBuf {
@@ -146,5 +176,40 @@ mod tests {
         set_enabled(false);
         assert!(store("a1", "x").is_none());
         assert!(load("a1").is_none());
+    }
+
+    /// 句柄编号是**每会话**的，因此原文也必须按会话分目录：否则两个会话的 `a1`
+    /// 会写到同一个文件上，`acp_decompress a1` 返回**别的会话的内容**。
+    #[test]
+    fn dir_should_be_scoped_by_session() {
+        set_dir_override(None);
+        set_session_key(None);
+        let shared = dir();
+
+        set_session_key(Some("sess-a".to_string()));
+        assert_eq!(dir(), shared.join("sess-a"));
+
+        set_session_key(Some("sess-b".to_string()));
+        assert_ne!(dir(), shared.join("sess-a"));
+
+        // 键未知时退回共享目录（功能不因此失效）。
+        set_session_key(None);
+        assert_eq!(dir(), shared);
+    }
+
+    /// 同一句柄在两个会话里互不覆盖。
+    #[test]
+    fn handles_should_not_collide_across_sessions() {
+        with_temp_dir(|| {
+            set_session_key(Some("sess-a".to_string()));
+            store("a1", "content from A");
+            set_session_key(Some("sess-b".to_string()));
+            store("a1", "content from B");
+
+            assert_eq!(load("a1").as_deref(), Some("content from B"));
+            set_session_key(Some("sess-a".to_string()));
+            assert_eq!(load("a1").as_deref(), Some("content from A"));
+            set_session_key(None);
+        });
     }
 }

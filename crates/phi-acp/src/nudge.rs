@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::prompts::{RULES_POINTER, TIER2_DIRECTIVE, TIER3_DIRECTIVE};
 use crate::prune::SUMMARY_HEADER;
+use crate::recommend::viable_ranges;
 use crate::state::active_blocks;
 use crate::tokenize::count_message_tokens;
 use crate::types::{
@@ -360,7 +361,9 @@ pub fn decide_nudge(input: NudgeInput<'_>) -> NudgeDecision {
 
     let (compressible_ranges, protected_ranges) = match input.recommendation {
         Some(rec) => (
-            rec.recommended_ranges.clone(),
+            // 与 TS 的 server.ts 一致：展示面只保留 ≥ VIABLE_RANGE_MIN_TOKENS
+            // 的范围，避免把碎片范围喂给模型导致整批 compress 被拒。
+            viable_ranges(&rec.recommended_ranges),
             rec.context_ranges.protected.clone(),
         ),
         None => (Vec::new(), Vec::new()),
@@ -415,41 +418,185 @@ fn format_breakdown(bd: &ContextBreakdown) -> String {
     format!("Context breakdown: {}{growth}", parts.join(" | "))
 }
 
-/// 格式化可压缩 / 受保护范围为单块最旧优先列表。
+/// 把数字 ref（`m00123`）解析为序号；失败返回 0。
+fn ref_num(reference: &str) -> usize {
+    reference
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}
+
+fn user_note(n: usize) -> String {
+    if n > 0 {
+        format!(" · {n} user msg{}", if n > 1 { "s" } else { "" })
+    } else {
+        String::new()
+    }
+}
+
+/// 合并后的范围条目（可压缩 + 受保护）。
+struct MergedRange {
+    start_ref: String,
+    end_ref: String,
+    start_num: usize,
+    end_num: usize,
+    start_pos: usize,
+    end_pos: usize,
+    count: usize,
+    tokens: u64,
+    user_msgs: usize,
+    compressible_tokens: u64,
+    compressible_count: usize,
+    protected_tokens: u64,
+    protected_count: usize,
+    protected_tools: Vec<String>,
+    tool_pct: u32,
+    text_pct: u32,
+    dangerous: bool,
+}
+
+/// 格式化可压缩 / 受保护范围为单块「最旧优先」列表。
+///
+/// 把可压缩与受保护范围**合并**成一份按位置排序的列表（对应上游 `formatRanges`）：
+/// 分成两段会丢掉时间顺序、也会掩盖重叠——一个范围可能一半可压一半受保护，只有
+/// 合并视图才能正确展示。相邻/重叠（间隙 ≤ 1 槽）的条目会合并。
 pub fn format_ranges(compressible: &[CompressibleRange], protected: &[ProtectedRange]) -> String {
     if compressible.is_empty() && protected.is_empty() {
         return "[No specific ranges detected — compress any consumed content.]".to_string();
     }
-    let mut lines = Vec::new();
-    let total = compressible.len() + protected.len();
+
+    let mut entries: Vec<MergedRange> = Vec::new();
     for r in compressible {
-        let user_note = match r.user_msgs.unwrap_or(0) {
-            0 => String::new(),
-            n => format!(" · {n} user msg{}", if n > 1 { "s" } else { "" }),
-        };
-        lines.push(format!(
-            "  {}–{}  {} msgs  {} [tool {}% | text {}%]{}",
-            r.start_ref,
-            r.end_ref,
-            r.count,
-            format_k(r.tokens),
-            r.tool_pct,
-            r.text_pct,
-            user_note
-        ));
+        entries.push(MergedRange {
+            start_ref: r.start_ref.clone(),
+            end_ref: r.end_ref.clone(),
+            start_num: ref_num(&r.start_ref),
+            end_num: ref_num(&r.end_ref),
+            start_pos: r.start_index.unwrap_or_else(|| ref_num(&r.start_ref)),
+            end_pos: r.end_index.unwrap_or_else(|| ref_num(&r.end_ref)),
+            count: r.count,
+            tokens: r.tokens,
+            user_msgs: r.user_msgs.unwrap_or(0),
+            compressible_tokens: r.tokens,
+            compressible_count: r.count,
+            protected_tokens: 0,
+            protected_count: 0,
+            protected_tools: Vec::new(),
+            tool_pct: r.tool_pct,
+            text_pct: r.text_pct,
+            dangerous: r.dangerous.unwrap_or(false),
+        });
     }
     for r in protected {
-        lines.push(format!(
-            "  {}–{}  {} msgs  {} [PROTECTED: {} — not compressible]",
-            r.start_ref,
-            r.end_ref,
-            r.count,
-            format_k(r.tokens),
-            r.tools.join(", ")
-        ));
+        entries.push(MergedRange {
+            start_ref: r.start_ref.clone(),
+            end_ref: r.end_ref.clone(),
+            start_num: ref_num(&r.start_ref),
+            end_num: ref_num(&r.end_ref),
+            start_pos: r.start_index.unwrap_or_else(|| ref_num(&r.start_ref)),
+            end_pos: r.end_index.unwrap_or_else(|| ref_num(&r.end_ref)),
+            count: r.count,
+            tokens: r.tokens,
+            user_msgs: 0,
+            compressible_tokens: 0,
+            compressible_count: 0,
+            protected_tokens: r.tokens,
+            protected_count: r.count,
+            protected_tools: r.tools.clone(),
+            tool_pct: 0,
+            text_pct: 0,
+            dangerous: false,
+        });
     }
+
+    // 按**位置**排序，绝不用 ref 序号：ref 可能与数组顺序非单调（子代理交错 /
+    // 数组中间的摘要节点），按序号排序/合并会让 resolveBoundaries 把端点塔缩成
+    // 极小切片（对应上游 #887）。
+    entries.sort_by(|a, b| {
+        a.start_pos
+            .cmp(&b.start_pos)
+            .then(a.start_num.cmp(&b.start_num))
+    });
+
+    let mut merged: Vec<MergedRange> = Vec::new();
+    for e in entries {
+        let can_merge = merged
+            .last()
+            .is_some_and(|last| e.start_pos <= last.end_pos + 1);
+        if can_merge {
+            let last = merged.last_mut().expect("已判非空");
+            last.end_ref = e.end_ref.clone();
+            last.end_num = last.end_num.max(e.end_num);
+            last.end_pos = last.end_pos.max(e.end_pos);
+            last.count += e.count;
+            last.tokens += e.tokens;
+            last.user_msgs += e.user_msgs;
+            last.compressible_tokens += e.compressible_tokens;
+            last.compressible_count += e.compressible_count;
+            last.protected_tokens += e.protected_tokens;
+            last.protected_count += e.protected_count;
+            if e.dangerous {
+                last.dangerous = true;
+            }
+            for t in &e.protected_tools {
+                if !last.protected_tools.contains(t) {
+                    last.protected_tools.push(t.clone());
+                }
+            }
+        } else {
+            merged.push(e);
+        }
+    }
+
+    let lines: Vec<String> = merged
+        .iter()
+        .map(|e| {
+            let suffix = if e.dangerous && e.compressible_tokens > 0 {
+                "  ⚠️ NOT recommended unless you are certain."
+            } else {
+                ""
+            };
+            if e.protected_tokens > 0 && e.compressible_tokens == 0 {
+                format!(
+                    "  {}–{}  {} msgs  {} [PROTECTED: {} — not compressible]{suffix}",
+                    e.start_ref,
+                    e.end_ref,
+                    e.count,
+                    format_k(e.tokens),
+                    e.protected_tools.join(", ")
+                )
+            } else if e.protected_tokens > 0 && e.compressible_tokens > 0 {
+                format!(
+                    "  {}–{}  {} msgs  {} [{} compressible | {} protected: {}]{}{suffix}",
+                    e.start_ref,
+                    e.end_ref,
+                    e.count,
+                    format_k(e.tokens),
+                    format_k(e.compressible_tokens),
+                    format_k(e.protected_tokens),
+                    e.protected_tools.join(", "),
+                    user_note(e.user_msgs)
+                )
+            } else {
+                format!(
+                    "  {}–{}  {} msgs  {} [tool {}% | text {}%]{}{suffix}",
+                    e.start_ref,
+                    e.end_ref,
+                    e.count,
+                    format_k(e.tokens),
+                    e.tool_pct,
+                    e.text_pct,
+                    user_note(e.user_msgs)
+                )
+            }
+        })
+        .collect();
+
     format!(
-        "Compressible ranges ({total}, oldest first):\n{}",
+        "Compressible ranges ({}, oldest first):\n{}",
+        merged.len(),
         lines.join("\n")
     )
 }
@@ -666,31 +813,6 @@ pub fn render_nudge_text(
     compact(parts).join("\n")
 }
 
-/// 渲染人工触发（`/acp compress`）的压缩指令文本。
-///
-/// 与 [`render_nudge_text`] 的自动提醒不同：人工指令绕过增长率 / 使用率门限，
-/// 只要存在可压缩范围就生成一份「立即压缩」指令，交由模型调用 `compress` 工具。
-pub fn render_manual_compress_text(
-    decision: &NudgeDecision,
-    prompts: &crate::prompts::Prompts,
-) -> String {
-    let ranges_str = format_ranges(&decision.compressible_ranges, &decision.protected_ranges);
-    let parts: Vec<String> = vec![
-        "[MANUAL COMPRESS] The user requested compression explicitly. Call the `compress` tool now in a single call."
-            .to_string(),
-        String::new(),
-        prompts.compress_philosophy.clone(),
-        String::new(),
-        RULES_POINTER.to_string(),
-        String::new(),
-        ranges_str,
-        String::new(),
-        "💡 Compress all ranges in one call (pass multiple content entries: `content: [{...}, {...}]`)."
-            .to_string(),
-    ];
-    compact(parts).join("\n")
-}
-
 fn compact(parts: Vec<String>) -> Vec<String> {
     let mut out = parts;
     while out.first().is_some_and(|s| s.is_empty()) {
@@ -703,6 +825,78 @@ fn compact(parts: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn cr(
+        start: &str,
+        end: &str,
+        count: usize,
+        tokens: u64,
+        start_index: usize,
+    ) -> CompressibleRange {
+        CompressibleRange {
+            start_ref: start.into(),
+            end_ref: end.into(),
+            count,
+            tokens,
+            start_index: Some(start_index),
+            end_index: Some(start_index + count - 1),
+            ..Default::default()
+        }
+    }
+
+    fn pr(
+        start: &str,
+        end: &str,
+        count: usize,
+        tokens: u64,
+        tools: &[&str],
+        start_index: usize,
+    ) -> ProtectedRange {
+        ProtectedRange {
+            start_ref: start.into(),
+            end_ref: end.into(),
+            count,
+            tokens,
+            tools: tools.iter().map(|s| s.to_string()).collect(),
+            start_index: Some(start_index),
+            end_index: Some(start_index + count - 1),
+        }
+    }
+
+    #[test]
+    fn format_ranges_should_merge_compressible_and_protected_in_position_order() {
+        // protected 在中间：合并后应体现时间顺序，而不是「先全部 compressible 再 protected」。
+        let compressible = vec![
+            cr("m00001", "m00002", 2, 1000, 0),
+            cr("m00005", "m00006", 2, 1000, 6),
+        ];
+        let protected = vec![pr("m00003", "m00004", 2, 500, &["read"], 3)];
+        let out = format_ranges(&compressible, &protected);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "{out}");
+        assert!(lines[1].contains("m00001"), "{out}");
+        assert!(lines[2].contains("PROTECTED"), "{out}");
+        assert!(lines[3].contains("m00005"), "{out}");
+        assert!(out.contains("(3, oldest first)"), "{out}");
+    }
+
+    #[test]
+    fn format_ranges_should_mark_partly_protected_ranges() {
+        // 位置相邻（间隙 ≤ 1）的 compressible + protected 应合并为一条混合条目。
+        let compressible = vec![cr("m00001", "m00002", 2, 1000, 0)];
+        let protected = vec![pr("m00003", "m00004", 2, 500, &["read"], 2)];
+        let out = format_ranges(&compressible, &protected);
+        assert!(out.contains("1.0K compressible"), "{out}");
+        assert!(out.contains("500 protected"), "{out}");
+        assert!(out.contains("(1, oldest first)"), "{out}");
+    }
+
+    #[test]
+    fn format_ranges_should_flag_dangerous_ranges() {
+        let mut dangerous = cr("m00001", "m00002", 2, 1000, 0);
+        dangerous.dangerous = Some(true);
+        let out = format_ranges(&[dangerous], &[]);
+        assert!(out.contains("NOT recommended"), "{out}");
+    }
     #[test]
     fn adaptive_growth_should_clamp() {
         let mut config = Config::default_for(200_000);
@@ -761,24 +955,6 @@ mod tests {
         });
         assert!(decision.should_inject);
         assert_eq!(decision.tier, Some(1));
-    }
-
-    #[test]
-    fn manual_compress_text_should_include_header_and_ranges() {
-        let decision = NudgeDecision {
-            compressible_ranges: vec![CompressibleRange {
-                start_ref: "m00001".into(),
-                end_ref: "m00010".into(),
-                count: 10,
-                tokens: 1_234,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let text = render_manual_compress_text(&decision, &crate::prompts::Prompts::default());
-        assert!(text.starts_with("[MANUAL COMPRESS]"));
-        assert!(text.contains("m00001"));
-        assert!(text.contains("Rules:"));
     }
 
     /// 提醒文本会永久留在会话历史里，必须保持精简。

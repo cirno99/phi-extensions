@@ -3,13 +3,13 @@
 use phi_ext::phi;
 
 use crate::config::{self, EXTENSION_NAME};
-use crate::prompts::Prompts;
 use crate::runtime::Shared;
 
 /// 用法说明。
 const USAGE: &str = "📋 /acp 子命令：\n\
   status                       — 上下文使用率、块统计与可压缩范围（默认）\n\
-  compress                     — 立即压缩当前可压缩范围（交由模型调用 compress 工具）\n\
+  compress                     — 查看当前可压缩范围（仅信息展示；phi 无请求体钩子，compress 不减少上游 token）\n\
+  absorb                       — absorb 诊断：真正回收上下文的通道（阈值 / 已回收 / 明细）\n\
   enable | disable             — 开关扩展\n\
   config <key> <value>         — 设置配置（context-limit / render-tags / min-compress / max-summary-ratio / host-tokens / growth-tokens / min-growth-tokens / min-context-pct / max-context-pct / tier2-trigger / tier3-trigger / absorb / absorb-min-tokens / absorb-keep-prefix / absorb-keep-suffix / absorb-threshold-pct / absorb-always-above / auto-nudge）\n\
   rules                        — 列出持久规则\n\
@@ -52,10 +52,13 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                             tokens,
                             &guard.config.to_kernel_config(),
                         );
+                        let observed = guard.estimate_tokens();
+                        let mut empty_ranges = true;
                         let ranges = outcome
                             .nudge
                             .as_ref()
                             .map(|n| {
+                                empty_ranges = n.compressible_ranges.is_empty();
                                 crate::nudge::format_ranges(
                                     &n.compressible_ranges,
                                     &n.protected_ranges,
@@ -66,16 +69,39 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                         let gate = guard.config.absorb_context_threshold_pct;
                         let always_above = guard.config.absorb_always_above_tokens;
                         let auto_nudge = guard.config.auto_nudge_enabled;
-                        (report, ranges, absorbed, source, gate, auto_nudge, always_above)
+                        // 状态按会话存（见 `crate::session`）：报出来才能解释
+                        // 「为什么块账本是空的」——新会话本来就应该是空的。
+                        let session = guard.session_key().unwrap_or("unknown").to_string();
+                        (
+                            report,
+                            ranges,
+                            absorbed,
+                            source,
+                            gate,
+                            auto_nudge,
+                            always_above,
+                            observed,
+                            empty_ranges,
+                            session,
+                        )
+                    };
+                    // 超过限额且无内容可压时如实告知：compress 在 phi 上改不了宿主
+                    // 请求体，观察视图又远小于真实上下文。
+                    let note = if report.0.context_usage >= 1.0 && report.8 {
+                        "\n⚠️ 超过限额且本扩展视图内无可压缩内容。phi 上 compress 改不了宿主请求体——视图只覆盖用户输入 + 工具结果（看不到助手正文 / 推理 / 被压缩历史），可能远小于真实上下文。宿主只在**没有工具调用**的回合末尾才跑原生压缩（engine.go：`len(msg.ToolCalls)==0`），因此长时间的工具调用循环会让上下文单调上涨，无论 context_window 设多少。真正能减小的通道：absorb（此水位已最大力度），以及**结束本回合**（纯文本回复）以触发宿主压缩。"
+                    } else {
+                        ""
                     };
                     ctx.notify(
                         "info",
                         &format!(
-                            "ACP: {:.1}% ({}/{} tokens, {}) · absorb 门槛 {:.0}% / 强制吸收 ≥{} tok (已回收 {}) · 自动提醒 {} · active blocks {} · total {} · reclaimed {} tokens\n{}",
+                            "ACP: {:.1}% ({}/{} tokens, {}) · session {} · observed view ~{} tok · absorb 门槛 {:.0}% / 强制吸收 ≥{} tok (已回收 {}) · 自动提醒 {} · active blocks {} · total {} · reclaimed {} tokens\n{}{}",
                             report.0.context_usage * 100.0,
                             report.0.token_count,
                             report.0.model_context_limit,
                             report.3,
+                            report.9,
+                            report.7,
                             report.4 * 100.0,
                             report.6,
                             report.2,
@@ -83,13 +109,17 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                             report.0.active_blocks,
                             report.0.total_blocks,
                             report.0.tokens_compressed,
-                            report.1
+                            report.1,
+                            note
                         ),
                     );
                 }
 
                 "compress" => {
-                    let (count, text) = {
+                    // phi 没有请求体重写钩子，compress 只写块账本、不会减少上游 token；
+                    // 主动向模型提交「立即压缩」指令是净亏损路径（多花 token 写压不掉的摘要）。
+                    // 因此这里只做信息展示，真正回收上下文交给 absorb。
+                    let (count, ranges, absorbed) = {
                         let mut guard = shared.borrow_mut();
                         if !guard.config.enabled {
                             ctx.notify("warning", "phi-acp 已禁用，先执行 /acp enable");
@@ -101,21 +131,108 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                             .as_ref()
                             .map(|n| n.compressible_ranges.len())
                             .unwrap_or(0);
-                        let text = outcome.nudge.as_ref().map(|n| {
-                            crate::nudge::render_manual_compress_text(n, &Prompts::default())
-                        });
-                        (count, text)
+                        let ranges = outcome
+                            .nudge
+                            .as_ref()
+                            .map(|n| {
+                                crate::nudge::format_ranges(
+                                    &n.compressible_ranges,
+                                    &n.protected_ranges,
+                                )
+                            })
+                            .unwrap_or_default();
+                        let absorbed = guard.state.stats.absorbed_tokens;
+                        (count, ranges, absorbed)
                     };
-                    match text {
-                        Some(text) if count > 0 => {
-                            ctx.notify(
-                                "info",
-                                &format!("已请求压缩 {count} 个范围，模型将调用 compress 工具。"),
-                            );
-                            ctx.submit(&text);
-                        }
-                        _ => ctx.notify("info", "当前无可压缩范围。"),
+                    if count == 0 {
+                        ctx.notify(
+                            "info",
+                            &format!(
+                                "当前无可压缩范围（保护区外没有可压缩消息）。phi 上 compress 只写块账本、不减少上游 token；真正回收上下文的是 absorb（已回收 {absorbed} tokens，用 /acp absorb 看明细）。"
+                            ),
+                        );
+                    } else {
+                        ctx.notify(
+                            "info",
+                            &format!(
+                                "当前有 {count} 个可压缩范围（见下），但 phi 无请求体重写钩子，compress 只写块账本、不减少上游 token；真正回收上下文的是 absorb（已回收 {absorbed} tokens，用 /acp absorb 看明细）。\n{ranges}"
+                            ),
+                        );
                     }
+                }
+                "absorb" => {
+                    let (
+                        enabled,
+                        gate,
+                        always_above,
+                        min_tokens,
+                        keep_prefix,
+                        keep_suffix,
+                        absorbed,
+                        entries,
+                        by_tool,
+                    ) = {
+                        let guard = shared.borrow();
+                        let cfg = &guard.config;
+                        // 按工具聚合回收量：定位「谁在制造上下文」。
+                        let mut by_tool: Vec<(String, u64, usize)> = Vec::new();
+                        for rec in &guard.state.absorbed_outputs {
+                            match by_tool.iter_mut().find(|(name, _, _)| name == &rec.tool_name) {
+                                Some((_, tokens, count)) => {
+                                    *tokens += rec.tokens;
+                                    *count += 1;
+                                }
+                                None => by_tool.push((rec.tool_name.clone(), rec.tokens, 1)),
+                            }
+                        }
+                        by_tool.sort_by_key(|(_, tokens, _)| std::cmp::Reverse(*tokens));
+                        (
+                            cfg.absorb_enabled,
+                            cfg.absorb_context_threshold_pct,
+                            cfg.absorb_always_above_tokens,
+                            cfg.absorb_min_tool_tokens,
+                            cfg.absorb_keep_prefix_chars,
+                            cfg.absorb_keep_suffix_chars,
+                            guard.state.stats.absorbed_tokens,
+                            guard.state.absorbed_outputs.len(),
+                            by_tool,
+                        )
+                    };
+                    if !enabled {
+                        ctx.notify(
+                            "warning",
+                            "absorb 已关闭——这是 phi 上唯一能真正减少上游 token 的通道，建议 /acp config absorb true",
+                        );
+                        return Ok(());
+                    }
+                    let tools = if by_tool.is_empty() {
+                        "（暂无）".to_string()
+                    } else {
+                        by_tool
+                            .iter()
+                            .map(|(name, tokens, count)| format!("{name} {tokens} tok ×{count}"))
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    };
+                    ctx.notify(
+                        "info",
+                        &format!(
+                            "📥 absorb 诊断（phi 上唯一真正减少上游 token 的通道）\n\
+                             开关：on · 门槛：使用率 ≥{:.0}% 或单条 ≥{} tok · 最小 {} tok · 保留 {} + {} 字符\n\
+                             已回收：{} tokens / {} 条（句柄上限 {}）\n\
+                             按工具：{}\n\
+                             取回原文：acp_decompress <句柄>（如 a3）",
+                            gate * 100.0,
+                            always_above,
+                            min_tokens,
+                            keep_prefix,
+                            keep_suffix,
+                            absorbed,
+                            entries,
+                            crate::absorb_store::MAX_ENTRIES,
+                            tools,
+                        ),
+                    );
                 }
                 "enable" | "disable" => {
                     let enabled = subcommand == "enable";
@@ -279,7 +396,7 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                 "rules" => {
                     let lines = {
                         let guard = shared.borrow();
-                        crate::tools::format_rules_for_prompt(&guard.state)
+                        crate::rules::format_rules_list(&guard.state)
                     };
                     if lines.is_empty() {
                         ctx.notify("info", "没有持久规则。");
@@ -322,6 +439,7 @@ mod tests {
     fn usage_should_mention_subcommands() {
         assert!(USAGE.contains("status"));
         assert!(USAGE.contains("compress"));
+        assert!(USAGE.contains("absorb"));
         assert!(USAGE.contains("reset"));
         assert!(USAGE.contains("growth-tokens"));
         assert!(USAGE.contains("tier2-trigger"));

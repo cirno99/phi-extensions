@@ -22,8 +22,9 @@
 //! - 上下文使用率低于 `contextThresholdPct` 时（默认 0 = 不设门槛）。
 //! - 压完反而更长（小输出走了 keep 窗口）。
 //!
-//! 与 compress 块不同，吸收**不保留原文**：标记里说明原文已丢弃，模型若需要
-//! 细节应重新执行工具。这正是 `TIER` 提示词里「按需重跑」语义的落地。
+//! 原文可逆：默认把原文落到 `state/absorbed/<handle>.txt`，stub 里带句柄，模型用
+//! `acp_decompress <handle>` 即可逐字取回，不必重跑工具（见 [`crate::absorb_store`]）。
+//! 仅在原文仓库不可用时才退化为「已丢弃、需重跑」的旧措辞。
 
 use crate::tokenize::count_tokens;
 use crate::types::AbsorbConfig;

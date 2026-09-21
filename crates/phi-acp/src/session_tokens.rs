@@ -129,9 +129,12 @@ fn finish(tokens: Option<u64>) -> Option<u64> {
 ///    于是全程退回本地估算（实测高估/低估可达 40%）。
 /// 3. 进程 `PWD`（最后的兜底）。
 ///
+/// 除读 token 外，[`crate::session`] 也用它解析**当前会话 id**（文件名里的
+/// `<timestamp>_<id>.jsonl`）——`SessionStart` 事件不带会话 id。
+///
 /// **不做**「全局最新 `.jsonl`」回退：多项目并行时会读到别的项目的会话，
 /// 把别人的 usage 当成本会话的上下文，使用率判断随之错位。宁可不给数。
-fn active_session_file() -> Option<PathBuf> {
+pub(crate) fn active_session_file() -> Option<PathBuf> {
     let mut candidates: Vec<String> = vec![host_cwd()];
     if let Some(cwd) = parent_process_cwd() {
         candidates.push(cwd);

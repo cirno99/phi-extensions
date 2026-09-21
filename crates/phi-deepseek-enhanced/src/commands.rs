@@ -13,6 +13,8 @@ const USAGE: &str = "🐋 /deepseek 用法：\n\
   status                 — 显示当前配置与运行统计\n\
   on | off               — 总开关\n\
   anchor on | off        — 是否注入 We-need 推理锚点\n\
+  repeat on | off        — 首轮完整锚点之外，是否每轮追加极简风格提醒\n\
+  every <n>              — 风格提醒的间隔轮数（≥1，1 = 每轮）\n\
   minimal on | off       — Eternal Minimal 运行时守卫（阻止非核心工具直呼）\n\
   transport on | off     — minimal 下是否允许 read/write 直呼\n\
   strip on | off         — 是否剥离用户消息里的 Today/cwd 系统提醒\n\
@@ -73,7 +75,7 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                             ),
                         }
                     }
-                    "anchor" | "minimal" | "transport" | "strip" => {
+                    "anchor" | "minimal" | "transport" | "strip" | "repeat" => {
                         let Some(value) = tokens.get(1).and_then(|raw| parse_toggle(raw)) else {
                             ctx.notify("warning", USAGE);
                             return Ok(());
@@ -84,6 +86,7 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                                 "anchor" => guard.config.inject_anchor = value,
                                 "minimal" => guard.config.minimal = value,
                                 "transport" => guard.config.transport = value,
+                                "repeat" => guard.config.anchor_repeat = value,
                                 _ => guard.config.strip_date_cwd_reminder = value,
                             }
                         }
@@ -93,6 +96,27 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
                                 "info",
                                 &format!("✅ {subcommand} 已设为 {}", if value { "on" } else { "off" }),
                             ),
+                        }
+                    }
+                    "every" => {
+                        let Some(every) = tokens
+                            .get(1)
+                            .and_then(|raw| raw.parse::<i64>().ok())
+                            .filter(|value| *value >= 1 && *value <= config::MAX_ANCHOR_REPEAT_EVERY)
+                        else {
+                            ctx.notify(
+                                "warning",
+                                &format!(
+                                    "用法：/deepseek every <1..{}>（1 = 每轮提醒）",
+                                    config::MAX_ANCHOR_REPEAT_EVERY
+                                ),
+                            );
+                            return Ok(());
+                        };
+                        shared.borrow_mut().config.anchor_repeat_every = every as u32;
+                        match persist(&shared) {
+                            Some(err) => ctx.notify("error", &err),
+                            None => ctx.notify("info", &format!("✅ 风格提醒间隔已设为 {every} 轮")),
                         }
                     }
                     "reset" => {
@@ -129,11 +153,14 @@ fn status_summary(guard: &crate::state::State) -> String {
         format!("总开关：{}", toggle(config.enabled)),
         format!("注入锚点：{}", toggle(config.inject_anchor)),
         format!("压缩后重注入：{}", toggle(config.reanchor_after_compact)),
+        format!("每轮风格提醒：{}", toggle(config.anchor_repeat)),
+        format!("提醒间隔：{} 轮", config.anchor_repeat_every),
         format!("剥离 Today/cwd 提醒：{}", toggle(config.strip_date_cwd_reminder)),
         format!("Eternal Minimal 守卫：{}", toggle(config.minimal)),
         format!("传输工具直呼：{}", toggle(config.transport)),
         format!("核心工具：{}", config.core_tools.join(", ")),
         format!("传输工具：{}", config.transport_tools.join(", ")),
+        format!("本会话轮数：{}", guard.turns()),
         format!("本会话压缩次数：{}", guard.compactions),
         format!("被阻止的调用：{}", guard.blocked_calls),
     ];

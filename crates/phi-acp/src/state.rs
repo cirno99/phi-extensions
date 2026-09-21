@@ -18,6 +18,7 @@ pub fn create_initial_state() -> CompressionState {
         next_rule_id: Some(1),
         next_block_id: 1,
         next_run_id: 1,
+        next_message_seq: 1,
     }
 }
 
@@ -35,8 +36,16 @@ pub fn allocate_run_id(state: &mut CompressionState) -> String {
     format!("r{id}")
 }
 
-/// 分配一个可逆吸收句柄（`aN`）。
-pub fn allocate_absorb_id(state: &mut CompressionState) -> String {
+/// 预览下一个可逆吸收句柄（`aN`），**不修改状态**。
+///
+/// 工具结果的 absorb 判定需要先把句柄写进 stub 文本，但只有真正命中才应该
+/// 消耗它（未命中时若也推进计数器，句柄会凭空出现空洞）。
+pub fn peek_absorb_id(state: &CompressionState) -> String {
+    format!("a{}", state.next_absorb_id.max(1))
+}
+
+/// 提交一个可逆吸收句柄（`aN`），仅在真正命中吸收时调用。
+pub fn commit_absorb_id(state: &mut CompressionState) -> String {
     let id = state.next_absorb_id.max(1);
     state.next_absorb_id = id + 1;
     format!("a{id}")

@@ -2,7 +2,7 @@
 //!
 //! 纯函数：计算软保护区、可压缩范围与阈值合并。不产生副作用。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::protected::{
     collect_latest_protected, collect_protected_tool_call_ids, is_message_latest_protected,
@@ -94,83 +94,220 @@ pub fn compute_protected_refs(
     result
 }
 
-/// 计算应从可压缩集合中撤回的消息 id（避免拆分工具配对 / 推理运行）。
+/// 助手「动作」消息：助手文本或工具调用。
+fn is_assistant_act(message: &CoreMessage) -> bool {
+    message.role == Role::Assistant
+        && matches!(
+            message.content_type,
+            ContentType::Text | ContentType::ToolCall
+        )
+}
+
+/// 供压缩完整性使用的原子 turn 分组（对应 TS `computeTurnGroups`）。
 ///
-/// 简化自 TS 的 `computeIntegrityWithdrawals`：把候选集合视为一个「整体」，
-/// 若工具调用与结果不全在集合内、或推理运行与其伴随消息不全在集合内，
-/// 则把相关消息全部撤回。
-pub fn compute_integrity_withdrawals(
-    messages: &[CoreMessage],
-    candidates: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut withdrawn = BTreeSet::new();
-
-    // 工具配对：调用与结果必须同进同出。
-    let mut call_ids_in: BTreeSet<&str> = BTreeSet::new();
-    let mut result_ids_in: BTreeSet<&str> = BTreeSet::new();
+/// 一个 turn = 一段推理运行 + 紧随其后的助手文本/工具调用突发 + 与突发中工具调用
+/// 按 `toolCallId` 配对的全部工具结果。严格回显推理的供应商（DeepSeek 思考模式：
+/// “thinking 模式下的 reasoning_content 必须回传”）会拒绝「助手工具调用回合存活、
+/// 但其推理丢失」的重建请求，而所有 OpenAI 线协议供应商都会拒绝「调用已消失、结果
+/// 还在」的请求。因此 turn 对折叠是原子的：要么全折，要么全不折。
+///
+/// 分组基于相邻关系，与 `adjust_boundaries_for_reasoning_pairs` 一致：推理运行与
+/// 紧邻其后的助手突发配对。没有前置推理的突发，仍与其兄弟调用/结果成组。不属于任何
+/// turn 的消息不进入任何组。
+pub fn compute_turn_groups(messages: &[CoreMessage]) -> Vec<Vec<String>> {
+    let mut result_id_by_call_id: BTreeMap<&str, &str> = BTreeMap::new();
     for message in messages {
-        let Some(call_id) = message.tool_call_id.as_deref() else {
-            continue;
-        };
-        if !candidates.contains(&message.id) {
+        if message.content_type != ContentType::ToolResult || message.id.is_empty() {
             continue;
         }
-        match message.content_type {
-            ContentType::ToolCall => {
-                call_ids_in.insert(call_id);
-            }
-            ContentType::ToolResult => {
-                result_ids_in.insert(call_id);
-            }
-            _ => {}
-        }
-    }
-    for message in messages {
-        let Some(call_id) = message.tool_call_id.as_deref() else {
-            continue;
-        };
-        let split = match message.content_type {
-            ContentType::ToolCall => !result_ids_in.contains(call_id),
-            ContentType::ToolResult => !call_ids_in.contains(call_id),
-            _ => false,
-        };
-        if split && candidates.contains(&message.id) {
-            withdrawn.insert(message.id.clone());
+        if let Some(call_id) = message.tool_call_id.as_deref() {
+            result_id_by_call_id
+                .entry(call_id)
+                .or_insert(message.id.as_str());
         }
     }
 
-    // 推理运行：run 内所有消息要么全在集合内，要么全不在。
-    let mut i = 0;
-    while i < messages.len() {
-        if messages[i].content_type != ContentType::Reasoning {
-            i += 1;
+    let mut grouped: BTreeSet<&str> = BTreeSet::new();
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for i in 0..messages.len() {
+        let msg = &messages[i];
+        if msg.id.is_empty() || grouped.contains(msg.id.as_str()) {
             continue;
         }
-        let start = i;
-        let mut j = i;
-        while j + 1 < messages.len() && messages[j + 1].content_type == ContentType::Reasoning {
-            j += 1;
+        if msg.content_type != ContentType::Reasoning && !is_assistant_act(msg) {
+            continue;
         }
-        let companion = messages.get(j + 1);
-        let mut run: Vec<&CoreMessage> = messages[start..=j].iter().collect();
-        if let Some(c) = companion {
-            if c.role == Role::Assistant {
-                run.push(c);
+
+        let mut reasoning_start = i;
+        if msg.content_type == ContentType::Reasoning {
+            while reasoning_start > 0
+                && messages[reasoning_start - 1].content_type == ContentType::Reasoning
+            {
+                reasoning_start -= 1;
+            }
+        } else {
+            let mut s = i;
+            while s > 0 && is_assistant_act(&messages[s - 1]) {
+                s -= 1;
+            }
+            reasoning_start = s;
+            while reasoning_start > 0
+                && messages[reasoning_start - 1].content_type == ContentType::Reasoning
+            {
+                reasoning_start -= 1;
             }
         }
-        let any_in = run.iter().any(|m| candidates.contains(&m.id));
-        let all_in = run.iter().all(|m| candidates.contains(&m.id));
-        if any_in && !all_in {
-            for m in &run {
-                if candidates.contains(&m.id) {
-                    withdrawn.insert(m.id.clone());
+        let mut burst_start = reasoning_start;
+        while burst_start < messages.len()
+            && messages[burst_start].content_type == ContentType::Reasoning
+        {
+            burst_start += 1;
+        }
+        if burst_start >= messages.len() || !is_assistant_act(&messages[burst_start]) {
+            // 孤立推理运行（无伴随突发）：无配对约束。
+            continue;
+        }
+        let mut burst_end = burst_start;
+        while burst_end + 1 < messages.len() && is_assistant_act(&messages[burst_end + 1]) {
+            burst_end += 1;
+        }
+
+        let mut members: BTreeSet<&str> = BTreeSet::new();
+        for m in &messages[reasoning_start..=burst_end] {
+            if m.id.is_empty() {
+                continue;
+            }
+            members.insert(m.id.as_str());
+            if m.role == Role::Assistant && m.content_type == ContentType::ToolCall {
+                if let Some(call_id) = m.tool_call_id.as_deref() {
+                    if let Some(rid) = result_id_by_call_id.get(call_id) {
+                        members.insert(rid);
+                    }
                 }
             }
         }
-        i = j + 1;
+        for id in &members {
+            grouped.insert(id);
+        }
+        groups.push(members.into_iter().map(|s| s.to_string()).collect());
+    }
+    groups
+}
+
+/// 折叠完整性门的结果：必须改为保持可见的 id，以及涉及的 turn / 配对数量。
+pub struct IntegrityWithdrawals {
+    /// 必须保持可见的 id。
+    pub withdrawn: BTreeSet<String>,
+    /// 被撤回的 turn 数。
+    pub split_turn_count: usize,
+    /// 被撤回的工具配对数。
+    pub split_pair_count: usize,
+}
+
+/// 折叠完整性门（对应 TS `computeIntegrityWithdrawals`）：给定一次折叠要从可见流里
+/// 移除的 id（`folded_ids`），返回必须改为**保持可见**的 id。
+///
+/// - INV1 —— 存活的助手工具调用必须保留其推理运行：若某 turn 的推理被折叠、而同一
+///   turn 的某个调用存活，则整个 turn 撤回（全部成员保持可见）。
+/// - INV2 —— 工具调用与其结果是一次交换：被折叠拆开的配对一起撤回。
+///
+/// 两条不变式相互影响：为 INV2 撤回一个调用，会让某 turn 的推理仍被折叠、而它的调用
+/// 现在存活——正是 INV1 的分裂；为 INV1 撤回一个 turn，又可能使某个结果落单。单趟
+/// 固定顺序会漏掉这两者，因此重复到不再变化；每个 turn / 配对只处理一次、只报告一次。
+///
+/// 反向保持允许（#564）：推理与文本保持可见、而调用与其结果被折叠，仍是合法流。
+pub fn compute_integrity_withdrawals(
+    messages: &[CoreMessage],
+    folded_ids: &BTreeSet<String>,
+) -> IntegrityWithdrawals {
+    let mut remaining: BTreeSet<&str> = folded_ids.iter().map(|s| s.as_str()).collect();
+    let mut withdrawn: BTreeSet<String> = BTreeSet::new();
+    let mut handled_turns: BTreeSet<usize> = BTreeSet::new();
+    let mut handled_pairs: BTreeSet<&str> = BTreeSet::new();
+
+    let mut reasoning_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut call_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut call_id_by_message_id: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut result_id_by_call_id: BTreeMap<&str, &str> = BTreeMap::new();
+    for m in messages {
+        if m.id.is_empty() {
+            continue;
+        }
+        if m.content_type == ContentType::Reasoning {
+            reasoning_ids.insert(m.id.as_str());
+        }
+        if m.role == Role::Assistant && m.content_type == ContentType::ToolCall {
+            call_ids.insert(m.id.as_str());
+            if let Some(call_id) = m.tool_call_id.as_deref() {
+                call_id_by_message_id.insert(m.id.as_str(), call_id);
+            }
+        }
+        if m.content_type == ContentType::ToolResult {
+            if let Some(call_id) = m.tool_call_id.as_deref() {
+                result_id_by_call_id.entry(call_id).or_insert(m.id.as_str());
+            }
+        }
     }
 
-    withdrawn
+    let groups = compute_turn_groups(messages);
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        for (g, group) in groups.iter().enumerate() {
+            if handled_turns.contains(&g) {
+                continue;
+            }
+            let fold_has_reasoning = group
+                .iter()
+                .any(|id| remaining.contains(id.as_str()) && reasoning_ids.contains(id.as_str()));
+            if !fold_has_reasoning {
+                continue;
+            }
+            let kept_has_call = group
+                .iter()
+                .any(|id| !remaining.contains(id.as_str()) && call_ids.contains(id.as_str()));
+            if !kept_has_call {
+                continue;
+            }
+            handled_turns.insert(g);
+            for id in group {
+                remaining.remove(id.as_str());
+                withdrawn.insert(id.clone());
+            }
+            changed = true;
+        }
+
+        for m in messages {
+            if m.id.is_empty() || !call_ids.contains(m.id.as_str()) {
+                continue;
+            }
+            let Some(call_id) = call_id_by_message_id.get(m.id.as_str()).copied() else {
+                continue;
+            };
+            if handled_pairs.contains(call_id) {
+                continue;
+            }
+            let Some(result_id) = result_id_by_call_id.get(call_id).copied() else {
+                continue;
+            };
+            if remaining.contains(m.id.as_str()) == remaining.contains(result_id) {
+                continue;
+            }
+            handled_pairs.insert(call_id);
+            remaining.remove(m.id.as_str());
+            remaining.remove(result_id);
+            withdrawn.insert(m.id.clone());
+            withdrawn.insert(result_id.to_string());
+            changed = true;
+        }
+    }
+
+    IntegrityWithdrawals {
+        withdrawn,
+        split_turn_count: handled_turns.len(),
+        split_pair_count: handled_pairs.len(),
+    }
 }
 
 /// 构建可压缩 / 受保护范围。
@@ -250,7 +387,7 @@ pub fn build_compressible_ranges(
 
     // 撤回会拆分配对 / 推理运行的消息。
     let candidate_ids: BTreeSet<String> = compressible_msgs.iter().map(|i| i.id.clone()).collect();
-    let withdrawn = compute_integrity_withdrawals(messages, &candidate_ids);
+    let withdrawn = compute_integrity_withdrawals(messages, &candidate_ids).withdrawn;
     if !withdrawn.is_empty() {
         let mut kept: Vec<CompressibleInfo> = Vec::new();
         let mut gap_pending = false;
@@ -438,6 +575,24 @@ pub fn merge_ranges_to_threshold(
     result
 }
 
+/// 可推荐范围的最小 token 数（对应 TS `VIABLE_RANGE_MIN_TOKENS`）。
+///
+/// 低于此值的范围是碎片残留（一条 16 token 的 ack、一行工具结果）：模型写不出
+/// 一个满足 ≥50 字符的摘要，而且一次包含它的**批量** compress 会被内核**整批**
+/// 拒绝（内核校验整批）——线上观察到过「14 个范围里夹一个 16 token 范围 → 每次
+/// 批量尝试都以 Summary too short 失败」。因此所有**展示**范围的面（注入的提醒、
+/// acp_status、/acp 面板）都要先过这层过滤。
+pub const VIABLE_RANGE_MIN_TOKENS: u64 = 200;
+
+/// 丢弃低于 `VIABLE_RANGE_MIN_TOKENS` 的碎片范围。
+pub fn viable_ranges(ranges: &[CompressibleRange]) -> Vec<CompressibleRange> {
+    ranges
+        .iter()
+        .filter(|r| r.tokens >= VIABLE_RANGE_MIN_TOKENS)
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +617,26 @@ mod tests {
         );
         state.message_refs = result.map;
         state
+    }
+    fn range(tokens: u64) -> CompressibleRange {
+        CompressibleRange {
+            start_ref: "m00001".into(),
+            end_ref: "m00002".into(),
+            tokens,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn viable_ranges_drops_fragments_below_floor() {
+        // 边界：正好等于下限保留，低于下限丢弃，空输入为空。
+        let ranges = vec![range(16), range(199), range(200), range(5000)];
+        let kept = viable_ranges(&ranges);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].tokens, 200);
+        assert_eq!(kept[1].tokens, 5000);
+        assert_eq!(VIABLE_RANGE_MIN_TOKENS, 200);
+        assert!(viable_ranges(&[]).is_empty());
     }
 
     #[test]
@@ -555,7 +730,7 @@ mod tests {
             },
         ];
         let candidates: BTreeSet<String> = ["c".to_string()].into_iter().collect();
-        let withdrawn = compute_integrity_withdrawals(&messages, &candidates);
+        let withdrawn = compute_integrity_withdrawals(&messages, &candidates).withdrawn;
         assert!(withdrawn.contains("c"));
     }
 
@@ -578,6 +753,68 @@ mod tests {
             },
         ];
         let candidates: BTreeSet<String> = ["c".to_string(), "r".to_string()].into_iter().collect();
-        assert!(compute_integrity_withdrawals(&messages, &candidates).is_empty());
+        assert!(compute_integrity_withdrawals(&messages, &candidates)
+            .withdrawn
+            .is_empty());
+    }
+
+    fn reasoning(id: &str) -> CoreMessage {
+        CoreMessage {
+            id: id.into(),
+            role: Role::Assistant,
+            content_type: ContentType::Reasoning,
+            ..Default::default()
+        }
+    }
+
+    fn tool_call(id: &str, call_id: &str) -> CoreMessage {
+        CoreMessage {
+            id: id.into(),
+            role: Role::Assistant,
+            content_type: ContentType::ToolCall,
+            tool_call_id: Some(call_id.into()),
+            ..Default::default()
+        }
+    }
+
+    fn tool_result(id: &str, call_id: &str) -> CoreMessage {
+        CoreMessage {
+            id: id.into(),
+            role: Role::Tool,
+            content_type: ContentType::ToolResult,
+            tool_call_id: Some(call_id.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn turn_groups_should_pair_reasoning_with_burst_and_results() {
+        let messages = vec![reasoning("th"), tool_call("c", "x"), tool_result("r", "x")];
+        let groups = compute_turn_groups(&messages);
+        assert_eq!(groups.len(), 1);
+        let group: BTreeSet<&str> = groups[0].iter().map(|s| s.as_str()).collect();
+        let expected: BTreeSet<&str> = ["th", "c", "r"].into_iter().collect();
+        assert_eq!(group, expected);
+    }
+
+    #[test]
+    fn integrity_should_withdraw_turn_when_reasoning_folds_but_call_kept() {
+        // INV1：推理被折叠、同一 turn 的调用存活 → 整个 turn 撤回。
+        let messages = vec![reasoning("th"), tool_call("c", "x"), tool_result("r", "x")];
+        let folded: BTreeSet<String> = ["th".to_string()].into_iter().collect();
+        let result = compute_integrity_withdrawals(&messages, &folded);
+        assert!(result.withdrawn.contains("th"));
+        assert!(result.withdrawn.contains("c"));
+        assert!(result.withdrawn.contains("r"));
+        assert_eq!(result.split_turn_count, 1);
+    }
+
+    #[test]
+    fn integrity_should_keep_reverse_direction() {
+        // #564：推理+文本存活、调用与结果折叠 → 合法流，不撤回。
+        let messages = vec![reasoning("th"), tool_call("c", "x"), tool_result("r", "x")];
+        let folded: BTreeSet<String> = ["c".to_string(), "r".to_string()].into_iter().collect();
+        let result = compute_integrity_withdrawals(&messages, &folded);
+        assert!(result.withdrawn.is_empty(), "{:?}", result.withdrawn);
     }
 }

@@ -69,15 +69,16 @@ scripts/install.sh --debug  # 构建 debug
 | 入口 | 说明 |
 |---|---|
 | `compress` 工具 | 模型写摘要压缩一个 ref 区间；返回新建块账本（`bN=mAAAAA–mBBBBB`） |
-| `acp_decompress` / `acp_search` | 恢复被压缩块（`bN`）或可逆吸收的原文（句柄 `aN`） / 按相关度检索块 |
+| `acp_decompress` / `acp_search` | 恢复被压缩块的内容（默认只上溯一层：嵌套活跃子块显示摘要；`full:true` 递归到原始消息；**无状态**，块保持压缩、重复调用免费；内容 >10000 字符写入临时文件）或可逆吸收的原文（句柄 `aN`） / 按相关度检索**全部块（含失活）+ 已折叠的历史消息** |
 | `acp_status` | 使用率、块统计（含 absorbed）与当前可压缩范围 |
-| `acp_rule` | 记录永不压缩、每轮重注入的持久规则 |
-| `/acp status\|compress\|enable\|disable\|config …\|rules\|reset\|help` | 状态面板、手动压缩与配置 |
+| `acp_rule` | 记录永不压缩的持久规则（`add`/`list`/`remove`/`clear`；单条 ≤300 字符、最多 50 条、拒绝重复；带 `[ruleN]` 供删除） |
+| `/acp status\|absorb\|compress\|enable\|disable\|config …\|rules\|reset\|help` | 状态面板、absorb 诊断、可压缩范围查看与配置 |
 
-`before_agent_start` 每会话**只注入一次**精炼压缩契约（+ 持久规则）；`turn_stopping`
-按增长量发提醒（带连续上限防死循环）；`user_input` / `tool_call` / `tool_result` 维护
-本扩展自己的消息观测视图。配置：`~/.phi/extensions/phi-acp/config.json`，
-状态：`~/.phi/extensions/phi-acp/state/state.json`。
+`before_agent_start` 每会话**只注入一次**精炼压缩契约；持久规则只在**内容变化 / 新会话 /
+宿主压缩后**重发（两者都会被拼进用户消息并永久留在历史里，每轮重发 = 每轮永久 +N token）；
+`turn_stopping` 按增长量发提醒（带连续上限防死循环）；`user_input` / `tool_call` /
+`tool_result` 维护本扩展自己的消息观测视图。配置：`~/.phi/extensions/phi-acp/config.json`，
+状态：`~/.phi/extensions/phi-acp/state/sessions/<会话 id>.json`（**每会话一个**，见下）。
 
 **在 phi 上什么真正省 token**：`tool_result` 拦截里把巨型工具输出换成「头 + 尾 +
 `[acp absorb]` 标记」并回写（`absorbEnabled`，默认开）——这是宿主上唯一能把内容从
@@ -87,7 +88,53 @@ phi 没有消息历史 / 请求体重写钩子，摘要只落在扩展自己的 
 
 - 需要控制上下文大小 → 调 `absorb*`（`absorb-min-tokens` / `absorb-keep-prefix` /
   `absorb-keep-suffix` / `absorb-threshold-pct` / `absorb-always-above` / `absorb-exclude-tools`）。
-- 需要写摘要时 → `compress` 仍然有价值（模型可 `acp_search` / `acp_decompress`）。
+- 想知道 absorb 到底回收了多少、谁在制造上下文 → `/acp absorb`（当前阈值、累计回收、按工具明细、句柄上限）。
+- 需要写摘要时 → `compress` 仍然有价值（模型可 `acp_search` / `acp_decompress`）；`/acp compress` 只**展示**可压缩范围，不再主动让模型压缩（那条指令是净亏损）。
+
+**状态按会话存（本轮修掉的第二个大缺口）**：上游 `billion-context` 的压缩状态是**按会话**
+存的（`src/paths.ts` 的 `sessionsDir()`：*"Sessions dir: one JSON file per session"*；
+`src/persist.ts` 落盘 `PersistedSession { id, state }`）。本扩展早先只有一个全局
+`state.json`，于是**新会话会继承上一个会话的 ref 索引与块账本**：`acp_status` 报出宿主机
+历史里根本不存在的可压缩范围，模型照着这些 ref 调 `compress` 必然被 ref 门拒绝——这正是
+「压缩失败 / 无作用」的一个直接来源。现在状态落到 `state/sessions/<会话 id>.json`，
+可逆吸收的原文也按会话分目录（句柄编号是每会话的，共用目录会让 `a1` 互相覆盖，
+`acp_decompress` 返回**别的会话的内容**）。
+
+会话 id 的来源值得记一笔：**phi 的 `SessionStart` 事件不带当前会话 id**
+（`internal/extension/proc.go:755` 只转发 `Reason` 与 `PreviousSessionID`，
+`ext.SessionStartEvent.SessionID` 被丢掉）。因此会话 id 从会话**文件名**解析
+（`internal/session/manager.go:113` 的 `<timestamp>_<32位十六进制>.jsonl`）。
+该文件是惰性创建的，所以 `/new` 之后一段时间文件探测仍指向上一个会话——
+代码把 `reason == "new"` 当权威信号，并在键未知时**不落盘**（否则新会话的空状态会
+覆盖掉上一个会话的账本，而那是被压内容唯一的记录）。旧版的全局 `state.json` 会在
+首次启动时**改名**进会话目录（改名而非复制：否则每个新会话都会再采纳一次同一个旧文件）。
+
+顺带修掉一个更隐蔽的 ref 错配：观测消息的**原始 id**（`msg1` / `msg2` …）此前是纯进程内
+计数器，不落盘。重启后它从 1 重新数，新消息就拿到**已经用过的**原始 id；而
+`assign_refs` 见到 `byRaw` 里已有该 id 就跳过分配（「首次分配后永不重分配」），于是新消息
+默默继承了旧消息的 ref——模型按 ref 压缩时压到的是另一段内容。上游没有这个问题，因为
+`CoreMessage.id` 由宿主提供、天然唯一；本扩展只能用计数器造，所以计数器进了状态文件
+（`nextMessageSeq`）。
+
+**检索引擎（换掉了上游的遗留路径）**：`acp_search` 此前是 acp-kernel
+`compress.ts::scoreRelevance` 的逐字移植——即上游的**遗留**子串路径 `core.search`
+（注意：`billion-context` 至今也还在用它，迁移计划是 acp-kernel issue #44）。上游在
+`search/SEARCH.md` 里点名了它三处短板：只看**活跃**块（失活块里的历史再也搜不到）、只做
+子串计数（`the` ≈ `theater`，不懂形态 / 错拼 / CJK 词边界）、不检索消息。现已整体移植上游
+推荐的生产路径 `searchBlocks`（`src/search/` → `src/search/`：`tokenizer` / `stemmer` /
+`doc_cache` / `registry` / `substring` / `bm25` / `fuzzy` / `hybrid`；默认 `hybrid` =
+0.7·BM25(词干) + 0.3·fuzzy bigram，再按角色加权 user 1.5 / assistant 1.0 / tool 0.6 /
+block 1.0）。语料是**全部块（含失活）+ 已折叠的历史消息**，消息命中会标出「压缩掉它的块」，
+形成上游的 search → decompress 闭环。本地小语料差分基准：遗留子串 MRR 0.625 vs hybrid
+1.000（上游 32 块 / 48 查询上是 0.797 vs 0.898）。
+
+一处**有意偏差**：上游用 `Intl.Segmenter("zh", { granularity: "word" })`（ICU CLDR 词典）
+切 CJK 词；Rust 没有内建等价物，而 acp-kernel 明确以「零运行时依赖」为设计前提，因此 CJK
+一律用**重叠 bigram** 近似词条（多字段出 bigram，单字文本出单字）。后果：召回不减
+（`身份验证` 仍命中 `身份验证流程`），但上游靠词典避免的 `试验证明` 误命中 `验证` **会发生**
+——该偏差由 `tokenize_known_gap_cjk_false_hit_without_a_dictionary` 测试钉住，不会被误当成
+「已修复」。上游的 `semantic`（embedding 余弦，异步、默认不注册）未移植：phi 扩展没有异步
+检索通道。
 
 **可逆吸收（与两个原版对齐的关键修复）**：原版的 absorb 是**可逆**的——被吸收
 的工具输出仍留在宿主历史里，`decompress` 随时能取回，因此吸收只花上下文、不丢信息。
@@ -108,8 +155,14 @@ phi 上扩展拿不到历史，只能在 `tool_result` 拦截时替换模型看�
 `compress` 块只是可检索的账本。这不是移植遗漏，而是宿主能力边界——也是本扩展把
 `compress` 与 absorb 分开、并把默认回收策略压在 absorb 上的原因。
 
-**真正能让上下文变小的只有宿主压缩**：`internal/agent/engine.go` 在自然停轮后调
-`runCompact`，当 `contextTokens > context_window - 16384` 时保留约 20K 消息 + ≤13.1K 摘要、
+**真正能让上下文变小的只有宿主压缩**：`internal/agent/engine.go` 在**没有工具调用**的
+回合末尾（`len(msg.ToolCalls) == 0`）才调 `runCompact`，当
+`contextTokens > context_window - 16384` 时保留约 20K 消息 + ≤13.1K 摘要、其余历史丢弃。
+⚠️ **关键后果**：长时间的工具调用循环（助手每回合都发 tool call）永远不会进入这个分支，
+因此**即使已远超 context_window 也不会触发原生压缩**，上下文单调上涨直到上游报
+context-overflow（engine.go 的 overflow 恢复路径才会强制压缩）。想让上下文回落，必须
+**用一个纯文本回复结束回合**。这也是 `/acp status` 在超限且无可压缩范围时提示「结束本回合」
+的原因。扩展拿不到它保留了哪些消息，但能收到 `session_compact` 事件。收到后
 其余历史丢弃。扩展拿不到它保留了哪些消息，但能收到 `session_compact` 事件。收到后
 （`Runtime::on_host_compaction`）清空自己的观测视图与 token 快照（旧消息已从上游请求里
 消失，继续留着会让 `/acp status` 的估算与可压缩范围指向已不存在的内容）、重新注入一次
@@ -142,7 +195,7 @@ phi 上扩展拿不到历史，只能在 `tool_result` 拦截时替换模型看�
 **巨型输出的强制吸收**：`absorb` 的使用率门槛负责「先长后收」的波动，但它不应成为
 巨型输出的免死金牌——早期会话（水位远低于门槛）或高门槛配置下，一条几万 token 的
 构建 / 测试日志会完整留在历史里，直到水位涨到门槛才被处理。`absorb-always-above`
-（`absorbAlwaysAboveTokens`，默认 2000）让**任何** token 数 ≥ 该值的工具输出无论当前
+（`absorbAlwaysAboveTokens`，默认 1500）让**任何** token 数 ≥ 该值的工具输出无论当前
 水位多低都立即压成 stub；取 0 关闭该例外，退回纯门槛行为。
 
 **与 pi 版的差异**：billion-context 在 pi 里是一个改基地址 + 改 `fetch` 的 HTTP
@@ -157,11 +210,18 @@ phi 上扩展拿不到历史，只能在 `tool_result` 拦截时替换模型看�
 | 入口 | 说明 |
 |---|---|
 | `str_replace_editor` 工具 | `view` / `create` / `str_replace` / `insert`，行为与 pi 版一致 |
-| `/deepseek status\|on\|off\|anchor\|minimal\|transport\|strip\|reset\|help` | 配置与状态 |
+| `/deepseek status\|on\|off\|anchor\|repeat\|every\|minimal\|transport\|strip\|reset\|help` | 配置与状态 |
 
 `before_agent_start` 注入 “We need to …” 推理风格锚点并剥离用户消息里的
 Today/cwd 系统提醒；`tool_call` 在 `minimal` 模式下阻止非核心工具直呼。
 配置：`~/.phi/extensions/phi-deepseek-enhanced/config.json`。
+
+**锚点为什么要每轮重复**：完整锚点只在会话首轮（以及上下文压缩后）注入一次，
+随会话增长它会被后续对话历史淹没，而模型对「远离上下文尾部的指令」遵循度
+衰减很快——这正是「很少能进入 We-need 思维链」的主因。因此 `anchor_repeat`
+（默认开）让 `before_agent_start` 在其余轮次往当前用户消息**末尾**补一段极简
+风格提醒，`anchor_repeat_every`（默认 1）控制间隔轮数；`/deepseek repeat off`
+可退回「只在首轮注入」的旧行为。
 
 **与 pi 版的差异**（phi 宿主能力缺失）：
 

@@ -26,8 +26,6 @@ pub struct Runtime {
     pub state: CompressionState,
     /// 观测到的消息视图。
     pub messages: Vec<CoreMessage>,
-    /// 下一个观测消息 id。
-    next_message_seq: u64,
     /// 进行中的工具调用：toolCallId → 消息 id。
     active_tool_calls: HashMap<String, String>,
     /// 连续提醒次数（防止死循环）。
@@ -36,11 +34,28 @@ pub struct Runtime {
     pending_notices: Vec<String>,
     /// 复用的竞技场：单次压缩管线内的临时内存。
     scratch: Scratch,
+    /// 当前状态归属的会话键（`None` = 还认不出来，见 [`crate::session`]）。
+    ///
+    /// 键未知时**不落盘**：宁可这次不写，也不要把新会话的状态写进上一个会话的
+    /// 文件（那会毁掉那个会话的块账本——它是被压内容唯一的记录）。
+    session_key: Option<String>,
+    /// 被判定为「上一个会话」的键。
+    ///
+    /// `/new` 之后会话文件是**惰性创建**的（phi 在第一条消息时才 `os.Create`），
+    /// 于是在新文件出现之前，[`crate::session::current_session_key`] 会反复
+    /// 指向上一个会话。若不记住并拒绝它，[`Self::refresh_session_key`] 就会
+    /// 把新会话又接到旧账本上——bug 原样复现。
+    stale_key: Option<String>,
     /// 本会话是否已注入过压缩契约。
     ///
     /// 契约会被拼进用户消息并永久留在会话历史里，因此**每会话只需一次**；
     /// 每轮重复注入就是持续推大上下文。
     contract_injected: bool,
+    /// 上次注入给宿主的持久规则渲染文本（空串表示「当前无规则」）。
+    ///
+    /// 规则会随系统提示词注入，而 phi 把它拼进用户消息并永久留在历史里；
+    /// 因此只在**内容变化**时重发，而不是每轮重发（见 [`Self::take_prompt_append`]）。
+    rules_injected: String,
     /// 是否允许把状态写回磁盘。
     ///
     /// 单测里必须关掉：`Runtime::new()` 读的是用户**真实**的 config/state 路径，
@@ -53,19 +68,32 @@ pub struct Runtime {
 
 impl Runtime {
     /// 创建运行时并加载配置与状态。
+    ///
+    /// 状态**按会话**加载（见 [`crate::session`]）：进程启动时会话文件通常已存在，
+    /// 因此能直接定位到正确的账本；若还认不出来（`SessionStart` 尚未到达、
+    /// 或会话文件尚未落盘），先拿初始状态，等能认出来时再切。
     pub fn new() -> Self {
         let config = config::load();
-        let state = load_state();
+        let session_key = crate::session::current_session_key();
+        let state = load_state_for(session_key.as_deref(), true);
+        crate::absorb_store::set_session_key(session_key.clone());
+        Self::assemble(config, state, session_key)
+    }
+
+    /// 组装运行时。
+    fn assemble(config: AcpConfig, state: CompressionState, session_key: Option<String>) -> Self {
         Self {
             config,
             state,
             messages: Vec::new(),
-            next_message_seq: 1,
             active_tool_calls: HashMap::new(),
             consecutive_nudges: 0,
             pending_notices: Vec::new(),
             scratch: Scratch::with_capacity(16 * 1024),
+            session_key,
+            stale_key: None,
             contract_injected: false,
+            rules_injected: String::new(),
             persist_enabled: true,
             dirty: false,
         }
@@ -74,15 +102,34 @@ impl Runtime {
     /// 创建一个**不落盘**的运行时（单测专用）。
     ///
     /// 单测必须用它：`Runtime::new()` 指向用户真实的 state.json，测试里任何
-    /// `persist()` 都会把用户的压缩块抹掉。这个方法读到的状态依然是真实的，
-    /// 只是永不写回。
+    /// `persist()` 都会把用户的压缩块抹掉。
+    ///
+    /// 这里连用户的**会话目录也不读**（`session_key = None`）：`Runtime::new()`
+    /// 会去解析当前会话 id，而单测进程并不是会话进程，解析出来的可能是别的
+    /// 项目的会话；更危险的是 [`load_state_for`] 会把旧版全局 `state.json`
+    /// **改名**进会话目录——那是破坏性的，绝不能由测试触发。
     #[cfg(test)]
     pub fn new_isolated() -> Self {
-        let mut runtime = Self::new();
+        // 会话身份也隔离掉：默认实现会去读用户真实的会话目录，单测会因此变得
+        // 非确定性（取决于跑测试时机器上恰好有哪些会话）。
+        crate::session::set_key_override(Some(None));
+        let mut runtime =
+            Self::assemble(config::load(), crate::state::create_initial_state(), None);
         runtime.persist_enabled = false;
         // 连可逆吸收的原文也不要落到用户真实的 `state/absorbed` 目录。
         crate::absorb_store::set_enabled(false);
         runtime
+    }
+
+    /// 当前状态归属的会话键（`None` = 还没认出来）。
+    pub fn session_key(&self) -> Option<&str> {
+        self.session_key.as_deref()
+    }
+
+    /// 单测用：注入会话键（不落盘，不影响 `session_key` 之外的任何东西）。
+    #[cfg(test)]
+    pub fn set_session_key_for_test(&mut self, key: Option<&str>) {
+        self.session_key = key.map(str::to_string);
     }
 
     /// 内核配置（每次由扩展配置派生）。
@@ -100,16 +147,28 @@ impl Runtime {
         &mut self.scratch
     }
 
-    /// 取走本会话需要注入的压缩契约（已注入过则返回空串）。
+    /// 取走本会话需要注入的提示词附加段（压缩契约 + 持久规则）。
     ///
-    /// 只在 `before_agent_start` 调用。宿主每次会把它拼到用户消息尾部，
-    /// 该文本就永久留在会话历史里——所以每会话只发一次。
-    pub fn take_contract_injection(&mut self, contract: &str) -> String {
-        if self.contract_injected {
-            return String::new();
+    /// 只在 `before_agent_start` 调用。宿主每次会把它拼到**用户消息尾部**，
+    /// 该文本就永久留在会话历史里——因此：
+    /// - 契约每会话只发一次；
+    /// - 规则只在「内容变化 / 新会话 / 宿主压缩后」注入。规则条数少、变化稀疏，
+    ///   每轮重复注入等于每轮永久 +N token，正是本扩展要避免的反模式。
+    pub fn take_prompt_append(&mut self, contract: &str, rules: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if !self.contract_injected {
+            self.contract_injected = true;
+            if !contract.is_empty() {
+                parts.push(contract);
+            }
         }
-        self.contract_injected = true;
-        contract.to_string()
+        if rules != self.rules_injected {
+            self.rules_injected = rules.to_string();
+            if !rules.is_empty() {
+                parts.push(rules);
+            }
+        }
+        parts.join("\n\n")
     }
 
     /// 记录一条用户输入。
@@ -173,23 +232,19 @@ impl Runtime {
             raw_usage
         };
         let config = self.config.to_kernel_config().absorb.unwrap_or_default();
-        // 预分配句柄：stub 里带上它，模型可用 `acp_decompress <handle>` 取回原文。
-        // 未命中吸收时该计数器不落盘（dirty 未置位），因此不会凭空消耗句柄。
-        let handle = crate::state::allocate_absorb_id(&mut self.state);
+        // 预览句柄：stub 里带上它，模型可用 `acp_decompress <handle>` 取回原文。
+        // 只有真正命中吸收时才提交计数器（未命中既不落盘、也不在内存里留下空洞）。
+        let handle = crate::state::peek_absorb_id(&self.state);
         // 只有在原文仓库可用时才向模型承诺「可取回」；否则回退到旧措辞。
         let reversible = crate::absorb_store::is_enabled();
         let plan = absorb::plan_absorb(
-            tool_name,
-            &cleaned,
-            is_error,
-            usage,
-            &config,
-            &handle,
-            reversible,
+            tool_name, &cleaned, is_error, usage, &config, &handle, reversible,
         );
 
         let (text, replacement) = match plan {
             Some(plan) => {
+                // 命中：提交句柄计数器（未命中路径不消耗句柄）。
+                crate::state::commit_absorb_id(&mut self.state);
                 // 可逆吸收：原文落盘（失败则退化为旧行为——stub 仍带句柄，
                 // 但 `acp_decompress` 会如实报告“已过期/未找到”）。
                 crate::absorb_store::store(&plan.handle, &cleaned);
@@ -218,10 +273,15 @@ impl Runtime {
         replacement
     }
 
+    /// 分配一条观测消息的**原始 id**。
+    ///
+    /// 计数器存在 [`CompressionState`] 里（不是运行时字段）：它必须跨进程重启
+    /// 保持单调，否则新消息会拿到已经用过的原始 id，从而在
+    /// [`crate::refs::assign_refs`] 那里被误认为「已分配过」而继承旧 ref。
     fn next_id(&mut self) -> String {
-        let id = format!("msg{}", self.next_message_seq);
-        self.next_message_seq += 1;
-        id
+        let seq = self.state.next_message_seq.max(1);
+        self.state.next_message_seq = seq + 1;
+        format!("msg{seq}")
     }
 
     /// 记下一次可逆吸收，并在超过上限时淘汰最旧的条目（同时删掉其磁盘原文）。
@@ -229,12 +289,14 @@ impl Runtime {
     /// 上限存在的意义：句柄账本与磁盘文件会随会话无限增长，而真正会被回头
     /// 查阅的巨型输出通常只有最近几十条。
     fn remember_absorbed(&mut self, plan: &absorb::AbsorbPlan, tool_name: &str) {
-        self.state.absorbed_outputs.push(crate::types::AbsorbedOutput {
-            handle: plan.handle.clone(),
-            tool_name: tool_name.to_string(),
-            tokens: plan.original_tokens,
-            created_at: crate::time_now_ms(),
-        });
+        self.state
+            .absorbed_outputs
+            .push(crate::types::AbsorbedOutput {
+                handle: plan.handle.clone(),
+                tool_name: tool_name.to_string(),
+                tokens: plan.original_tokens,
+                created_at: crate::time_now_ms(),
+            });
         while self.state.absorbed_outputs.len() > crate::absorb_store::MAX_ENTRIES {
             let evicted = self.state.absorbed_outputs.remove(0);
             crate::absorb_store::remove(&evicted.handle);
@@ -321,14 +383,116 @@ impl Runtime {
         std::mem::take(&mut self.pending_notices)
     }
 
-    /// 新会话开始时的重置。
+    /// 新会话开始。
     ///
-    /// 只重置提醒计数与契约注入标记；**不**清空观测视图 / 压缩状态（无法可靠
-    /// 区分「新会话」与「会话内新 turn」，显式清空请用 `/acp reset`）。
-    pub fn on_session_start(&mut self) {
+    /// # 旧版的错（已修）
+    ///
+    /// 早先这里只重置提醒计数与注入标记，理由是「无法可靠区分新会话与会话内新
+    /// turn」。**那个理由不成立**：`SessionStart` 是与 `TurnStart` 分开的事件，
+    /// 而且带着 `reason`（`startup` / `resume` / `new`）。于是 `/new` 之后，上一个
+    /// 会话的观测视图、块账本与 ref 索引全部被继承下来：`acp_status` 报出宿主
+    /// 历史里不存在的可压缩范围，模型照着压缩必然被 ref 门拒绝——就是「压缩失败 /
+    /// 无作用」的一个直接来源。
+    ///
+    /// # 现在
+    ///
+    /// 会话键变了就换账本（[`crate::session`] 说明了键从哪来）。
+    ///
+    /// - `reason == "new"`：宿主历史为空，**一定**是换会话。即使键还解析不出来
+    ///   （会话文件惰性创建，此刻看到的是上一个会话的文件），也必须把内存状态
+    ///   重置并把 `session_key` 置空——**置空后不落盘**，否则会把新会话的空状态
+    ///   写进上一个会话的文件，毁掉它的账本。
+    /// - 其它 reason：拿解析出的键与当前键比对，不同才切。
+    pub fn on_session_start(&mut self, reason: &str, previous_session_id: &str) {
         self.reset_nudges();
         // 新会话要把契约重新注入一次。
         self.contract_injected = false;
+        // 规则同理：新会话历史里还没有它们。
+        self.rules_injected.clear();
+
+        let detected = crate::session::current_session_key();
+        if reason == "new" {
+            // `/new` 是权威信号（宿主历史为空）：文件探测此刻可能还指着上一个
+            // 会话（新会话文件尚未落盘），因此要能识别出「探测到的是刚离开的
+            // 会话」，而不能照单全收。
+            let leaving = if previous_session_id.is_empty() {
+                None
+            } else {
+                Some(crate::session::sanitize_key(previous_session_id))
+            };
+            let stale = (detected.is_some() && detected == self.session_key)
+                || (leaving.is_some() && detected == leaving);
+            if stale {
+                self.switch_session(None);
+            } else {
+                self.switch_session(detected);
+            }
+            return;
+        }
+        // 非 `/new` 路径：只在**确实解析出**会话键、且与当前不同时才换账本。
+        // 解析失败（cwd 探测抖动等）绝不能当作「换会话」——那会把内存里的账本
+        // 丢掉，而 `stale_key` 还会阻止它被重新采纳。
+        if let Some(key) = detected {
+            if self.session_key.as_deref() != Some(key.as_str()) {
+                self.switch_session(Some(key));
+            }
+        }
+    }
+
+    /// 换到另一个会话的账本（`None` = 新会话但键还认不出来）。
+    fn switch_session(&mut self, next: Option<String>) {
+        // 旧账本先落盘（可能还有未持久化的 absorb 统计）。
+        self.persist();
+        self.stale_key = self.session_key.take();
+        self.session_key = next.clone();
+        crate::absorb_store::set_session_key(next.clone());
+        self.reset_view();
+        // 键未知时拿**初始**状态：绝不能退回旧全局 `state.json`，那正是要修的 bug。
+        self.state = match next.as_deref() {
+            Some(key) => load_state_for(Some(key), false),
+            None => crate::state::create_initial_state(),
+        };
+        // 键未知时 `persist()` 直接返回——这是故意的：否则会把新会话的空状态
+        // 写进**上一个**会话的文件，毁掉它的块账本（被压内容唯一的记录）。
+        self.persist();
+    }
+
+    /// 会话键未知时尝试解析；解析到就接到该会话的账本上。
+    ///
+    /// 用在 [`Self::persist_if_dirty`]：`/new` 之后新会话文件要等第一条消息
+    /// 落盘才出现，而 `turn_stopping` 已是那之后，因此能自愈。
+    fn refresh_session_key(&mut self) {
+        if self.session_key.is_some() {
+            return;
+        }
+        let Some(key) = crate::session::current_session_key() else {
+            return;
+        };
+        // 拒绝重新采纳刚被判定为「上一个会话」的键（文件探测滞后时它会反复出现）。
+        if self.stale_key.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        self.session_key = Some(key.clone());
+        crate::absorb_store::set_session_key(Some(key.clone()));
+        // 只在磁盘上确实有一份账本时才覆盖内存状态：`/new` 后的第一 turn 可能
+        // 已经在内存里建了块，而那时文件还不存在（惰性创建）。
+        let loaded = load_state_for(Some(&key), false);
+        if !loaded.blocks.is_empty() {
+            self.state = loaded;
+        }
+    }
+
+    /// 丢弃属于**上一个**会话的观测视图与待展示告警。
+    ///
+    /// ref 是每会话的：新会话的消息从 `m00001` 重新编号，与它自己的块账本对齐。
+    fn reset_view(&mut self) {
+        self.messages.clear();
+        self.active_tool_calls.clear();
+        self.consecutive_nudges = 0;
+        self.contract_injected = false;
+        self.rules_injected.clear();
+        self.pending_notices.clear();
+        self.dirty = false;
     }
 
     /// 记录已提醒（返回 false 表示达到上限，应放行停止）。
@@ -344,17 +508,29 @@ impl Runtime {
 
     /// 持久化状态（原子写）。
     ///
-    /// 单测创建的运行时（[`Self::new_isolated`]）会静默跳过，避免污染用户的
-    /// 真实 `state.json`。
+    /// 写入**当前会话**的状态文件（`state/sessions/<会话键>.json`，见
+    /// [`crate::session`]）。
+    ///
+    /// 两种情况静默跳过：
+    /// - 单测创建的运行时（[`Self::new_isolated`]）——避免污染用户真实状态；
+    /// - 会话键未知（`/new` 之后、新会话文件落盘之前）——宁可本次不写，
+    ///   也不能把新会话的空状态写进上一个会话的文件。
     pub fn persist(&self) {
         if !self.persist_enabled {
             return;
         }
-        let _ = cfg::save_atomic(&config::state_path(), &self.state);
+        let Some(key) = self.session_key.as_deref() else {
+            return;
+        };
+        let _ = cfg::save_atomic(&config::session_state_path(key), &self.state);
     }
 
     /// 标记状态已变化，等待下次 [`Self::persist`] 落盘。
+    ///
+    /// 顺手解析一次会话键：状态一旦有变化就不该因为「键还没认出来」而丢失，
+    /// 而走到这里时宿主必然已经写过消息（会话文件已存在）。
     pub fn mark_dirty(&mut self) {
+        self.refresh_session_key();
         self.dirty = true;
     }
 
@@ -362,7 +538,11 @@ impl Runtime {
     ///
     /// 用在每 turn 都会经过的钩子里：absorb 统计这类「慢慢累加」的字段
     /// 需要定期落盘，但不能每 turn 无条件写盘。
+    ///
+    /// 顺手解析会话键：`/new` 之后新会话文件要到第一条消息落盘才出现，
+    /// 而本方法在 `turn_stopping` 里调用，已经是那之后，因此能自愈。
     pub fn persist_if_dirty(&mut self) {
+        self.refresh_session_key();
         if self.dirty {
             self.persist();
             self.dirty = false;
@@ -378,7 +558,6 @@ impl Runtime {
     pub fn reset_session(&mut self) {
         self.messages.clear();
         self.active_tool_calls.clear();
-        self.next_message_seq = 1;
         self.state = crate::state::create_initial_state();
         // 块账本连同可逆吸收的原文一起丢弃：`/acp reset` 的语义就是「忘掉一切」。
         crate::absorb_store::clear();
@@ -403,13 +582,16 @@ impl Runtime {
     /// 清空观测视图（旧消息已随宿主历史消失）与 token 快照，重新注入一次契约
     /// （它可能已随被摘要的旧历史一起消失），但**保留块账本**——块摘要是被压
     /// 内容的唯一记录，仍可 `acp_search` / `acp_decompress`。`next_message_seq`
-    /// 与 `message_refs` 不动：让新消息拿到递增的新 ref，避免与历史块里的旧 ref 撞号。
+    /// 与 `message_refs` 不动：让新消息拿到递增的新原始 id 与新 ref，
+    /// 避免与历史块里的旧 ref 撞号。
     pub fn on_host_compaction(&mut self) {
         self.messages.clear();
         self.active_tool_calls.clear();
         self.state.token_snapshot.clear();
         // 契约可能已随被摘要的旧历史一起消失，下个 agent start 重新注入一次。
         self.contract_injected = false;
+        // 规则同理（它们可能也已随旧历史消失）。
+        self.rules_injected.clear();
         self.reset_nudges();
         self.mark_dirty();
         self.persist_if_dirty();
@@ -427,9 +609,45 @@ impl Default for Runtime {
     }
 }
 
-/// 加载持久化状态（缺失或损坏时返回初始状态）。
-fn load_state() -> CompressionState {
-    cfg::load_or_default(&config::state_path())
+/// 加载指定会话的持久化状态（缺失或损坏时返回初始状态）。
+///
+/// `key` 为 `None`（认不出会话）时退回旧版的全局 `state.json`，保证
+/// 认不出会话时也不至于完全丢失账本。
+///
+/// `adopt_legacy` 只应为 `true` 一次——即进程启动时（[`Runtime::new`]）：
+/// 它会将旧版全局 `state.json` **改名**进会话目录（见 [`adopt_legacy_state`]）。
+/// 单测必须传 `false`，否则跑一次测试就把用户真实的旧状态文件搬走了。
+fn load_state_for(key: Option<&str>, adopt_legacy: bool) -> CompressionState {
+    let Some(key) = key else {
+        return cfg::load_or_default(&config::state_path());
+    };
+    let path = config::session_state_path(key);
+    if adopt_legacy && !path.exists() {
+        adopt_legacy_state(&path);
+    }
+    cfg::load_or_default(&path)
+}
+
+/// 把旧版的全局 `state.json` 采纳为本会话的账本。
+///
+/// # 为什么
+///
+/// 升级到「每会话状态」的用户，磁盘上只有旧版的全局 `state.json`。不采纳的话，
+/// 他的块账本（被压内容**唯一**的记录）就凭空消失了。
+///
+/// # 为什么是改名而不是复制
+///
+/// 复制的话，每个新会话都会再采纳一次同一个旧文件——新会话又继承旧账本，
+/// 正好是本次要修掉的 bug。改名后旧文件不复存在，采纳只会发生一次。
+fn adopt_legacy_state(target: &std::path::Path) {
+    let legacy = config::state_path();
+    if !legacy.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(config::sessions_state_dir()).is_err() {
+        return;
+    }
+    let _ = std::fs::rename(&legacy, target);
 }
 
 #[cfg(test)]
@@ -463,12 +681,12 @@ mod tests {
     fn contract_should_be_injected_once_per_session() {
         let mut runtime = Runtime::new_isolated();
         runtime.reset_session();
-        let first = runtime.take_contract_injection("CONTRACT");
+        let first = runtime.take_prompt_append("CONTRACT", "");
         assert_eq!(first, "CONTRACT");
-        assert!(runtime.take_contract_injection("CONTRACT").is_empty());
+        assert!(runtime.take_prompt_append("CONTRACT", "").is_empty());
         // 新会话重新开放一次。
-        runtime.on_session_start();
-        assert_eq!(runtime.take_contract_injection("CONTRACT"), "CONTRACT");
+        runtime.on_session_start("startup", "");
+        assert_eq!(runtime.take_prompt_append("CONTRACT", ""), "CONTRACT");
     }
 
     /// 宿主压缩后必须重新同步：观测视图清空、契约重注入，但块账本保留。
@@ -484,14 +702,14 @@ mod tests {
             active: true,
             ..Default::default()
         });
-        runtime.take_contract_injection("CONTRACT");
+        runtime.take_prompt_append("CONTRACT", "");
 
         runtime.on_host_compaction();
 
         assert!(runtime.messages.is_empty(), "观测视图应清空");
         assert_eq!(runtime.state.blocks.len(), 1, "块账本必须保留");
         // 契约可重新注入（可能已随被摘要的旧历史消失）。
-        assert_eq!(runtime.take_contract_injection("CONTRACT"), "CONTRACT");
+        assert_eq!(runtime.take_prompt_append("CONTRACT", ""), "CONTRACT");
         // ref 分配不回退：新消息的 id 继续递增，避免与历史块的旧 ref 撞号。
         runtime.record_user_input("after compact");
         assert_ne!(runtime.messages[0].id, "msg1");
@@ -547,7 +765,10 @@ mod tests {
         assert!(replacement.contains("acp_decompress"));
         assert_eq!(runtime.state.absorbed_outputs[0].tool_name, "bash");
         // 原文必须能从仓库逐字取回。
-        assert_eq!(crate::absorb_store::load(&handle).as_deref(), Some(big.as_str()));
+        assert_eq!(
+            crate::absorb_store::load(&handle).as_deref(),
+            Some(big.as_str())
+        );
 
         crate::absorb_store::set_enabled(false);
         crate::absorb_store::set_dir_override(None);
@@ -655,5 +876,204 @@ mod tests {
 
         runtime.persist_if_dirty();
         assert!(!runtime.dirty, "落盘后脏标记应清除");
+    }
+
+    /// 回归：未命中吸收不得消耗句柄，否则句柄号会出现空洞（旧实现在判定前就
+    /// 推进了 `nextAbsorbId`，注释却声称「未命中不会凭空消耗句柄」）。
+    #[test]
+    fn absorb_miss_should_not_consume_a_handle() {
+        let mut runtime = absorb_runtime();
+        runtime.config.absorb_min_tool_tokens = 100_000; // 门槛高到必然未命中
+        assert!(runtime
+            .record_tool_result("c1", "bash", "tiny output", false)
+            .is_none());
+        assert_eq!(
+            runtime.state.next_absorb_id, 1,
+            "未命中不得推进计数器（初始值为 1）"
+        );
+
+        runtime.config.absorb_min_tool_tokens = 100;
+        let big = "x".repeat(40_000);
+        let replacement = runtime
+            .record_tool_result("c2", "bash", &big, false)
+            .expect("应吸收");
+        assert!(replacement.len() < big.len(), "命中应折叠为 stub");
+        assert_eq!(
+            runtime.state.next_absorb_id, 2,
+            "首次命中应消费 a1（计数器 1 → 2），而不是被跳过后的 a3"
+        );
+    }
+
+    fn test_block(id: &str) -> crate::types::CompressionBlock {
+        crate::types::CompressionBlock {
+            block_id: id.to_string(),
+            summary: format!("summary of {id}"),
+            active: true,
+            ..Default::default()
+        }
+    }
+
+    /// 回归：`/new` 绝不能继承上一个会话的观测视图与块账本。
+    ///
+    /// 历史症状：新会话里 `acp_status` 报出宿主机历史里**不存在**的可压缩范围，
+    /// 模型照着这些 ref 调 `compress` 必然被 ref 门拒绝——表面症状就是
+    /// 「压缩失败 / 无作用」。
+    #[test]
+    fn new_session_must_not_inherit_the_previous_ledger() {
+        let mut runtime = Runtime::new_isolated();
+        runtime.set_session_key_for_test(Some("sess-old"));
+        runtime.state.blocks.push(test_block("b1"));
+        runtime.record_user_input("old session message");
+        assert_eq!(runtime.messages.len(), 1);
+
+        // `/new` 时新会话文件尚未落盘（惰性创建），探测结果 == 刚离开的会话。
+        crate::session::set_key_override(Some(Some("sess-old".to_string())));
+        runtime.on_session_start("new", "sess-old");
+
+        assert!(runtime.messages.is_empty(), "观测视图必须清空");
+        assert!(runtime.state.blocks.is_empty(), "块账本必须重置");
+        assert_eq!(runtime.session_key(), None, "键未知期间不得落盘");
+        assert_eq!(
+            runtime.state.next_message_seq, 1,
+            "ref 是每会话的，新会话重新编号"
+        );
+    }
+
+    /// 回归：键未知时**绝不**重新采纳刚离开的会话。
+    ///
+    /// 会话文件是惰性创建的，于是 `/new` 之后一段时间里
+    /// [`crate::session::current_session_key`] 会反复指向上一个会话；不挡住它，
+    /// 新会话就又接到旧账本上，bug 原样复现。
+    #[test]
+    fn unkeyed_session_must_not_re_adopt_the_stale_key() {
+        let mut runtime = Runtime::new_isolated();
+        runtime.set_session_key_for_test(Some("sess-old"));
+        runtime.state.blocks.push(test_block("b1"));
+        crate::session::set_key_override(Some(Some("sess-old".to_string())));
+        runtime.on_session_start("new", "sess-old");
+        assert_eq!(runtime.session_key(), None);
+
+        // 新会话文件还没出现：解析结果仍是旧会话 → 必须拒绝。
+        runtime.mark_dirty();
+        runtime.persist_if_dirty();
+        assert_eq!(runtime.session_key(), None, "不得把旧会话的账本接回来");
+        assert!(runtime.state.blocks.is_empty(), "不得恢复旧块");
+
+        // 新会话文件出现后，才接上它自己的账本。
+        crate::session::set_key_override(Some(Some("sess-new".to_string())));
+        runtime.mark_dirty();
+        runtime.persist_if_dirty();
+        assert_eq!(runtime.session_key(), Some("sess-new"));
+    }
+
+    /// `startup` 且会话键变了（重启进的是另一个会话）→ 换账本。
+    #[test]
+    fn startup_with_a_different_key_should_switch_the_ledger() {
+        let mut runtime = Runtime::new_isolated();
+        runtime.set_session_key_for_test(Some("sess-a"));
+        runtime.state.blocks.push(test_block("b1"));
+        runtime.record_user_input("from session a");
+
+        crate::session::set_key_override(Some(Some("sess-b".to_string())));
+        runtime.on_session_start("startup", "");
+
+        assert!(runtime.messages.is_empty(), "观测视图属于上一个会话");
+        assert!(runtime.state.blocks.is_empty(), "块账本属于上一个会话");
+        assert_eq!(runtime.session_key(), Some("sess-b"));
+    }
+
+    /// `startup` 且会话键没变（重启后回到同一会话）→ 保留账本。
+    #[test]
+    fn startup_with_the_same_key_should_keep_the_ledger() {
+        let mut runtime = Runtime::new_isolated();
+        runtime.set_session_key_for_test(Some("sess-a"));
+        runtime.state.blocks.push(test_block("b1"));
+
+        crate::session::set_key_override(Some(Some("sess-a".to_string())));
+        runtime.on_session_start("startup", "");
+
+        assert_eq!(runtime.state.blocks.len(), 1, "同一会话必须保留块账本");
+        assert_eq!(runtime.session_key(), Some("sess-a"));
+    }
+
+    /// 回归：会话键未知时 `persist()` 必须什么都不写——尤其不得写旧的全局
+    /// `state.json`（那是别的会话的账本）。
+    #[test]
+    fn persist_without_a_session_key_must_not_touch_the_legacy_file() {
+        let path = crate::config::state_path();
+        let before = std::fs::read(&path).ok();
+
+        let mut runtime = Runtime::new_isolated();
+        runtime.persist_enabled = true;
+        runtime.set_session_key_for_test(None);
+        runtime.persist();
+
+        assert_eq!(
+            std::fs::read(&path).ok(),
+            before,
+            "键未知时不得写旧全局 state.json"
+        );
+    }
+
+    /// 回归：原始消息 id 计数器必须跨重启保持单调。
+    ///
+    /// 计数器不落盘的话，重启后从 1 重新数，新消息会拿到**已经用过的**原始 id；
+    /// [`crate::refs::assign_refs`] 见到 `byRaw` 里已有该 id 就跳过分配
+    /// （「首次分配后永不重分配」），新消息于是默默继承了旧消息的 ref——
+    /// 模型按 ref 压缩时压到的是另一段内容。
+    #[test]
+    fn raw_message_ids_must_not_be_recycled_across_a_restart() {
+        let mut runtime = Runtime::new_isolated();
+        runtime.record_user_input("first");
+        runtime.record_user_input("second");
+        assert_eq!(runtime.messages[0].id, "msg1");
+        assert_eq!(runtime.messages[1].id, "msg2");
+
+        // 模拟进程重启：状态从磁盘读回（这里复用同一份），运行时字段全部重建。
+        let reloaded = runtime.state.clone();
+        let mut restarted = Runtime::new_isolated();
+        restarted.state = reloaded;
+        restarted.record_user_input("after restart");
+        assert_eq!(
+            restarted.messages[0].id, "msg3",
+            "重启后不得重用 msg1 / msg2"
+        );
+    }
+
+    /// 计数器必须真的进状态文件（而不是只活在内存里）。
+    #[test]
+    fn next_message_seq_should_round_trip_through_serde() {
+        let mut state = crate::state::create_initial_state();
+        state.next_message_seq = 7;
+        let json = phi_ext_common::json::to_vec(&state).expect("序列化");
+        let back: CompressionState = phi_ext_common::json::parse(&json).expect("反序列化");
+        assert_eq!(back.next_message_seq, 7);
+    }
+
+    /// 老状态文件没有这个字段 → 默认 1（与修复前的行为一致，不会更糟）。
+    #[test]
+    fn legacy_state_without_the_counter_should_default_to_one() {
+        let back: CompressionState =
+            phi_ext_common::json::parse_str(r#"{"nextBlockId":1,"nextRunId":1}"#)
+                .expect("反序列化");
+        assert_eq!(back.next_message_seq, 1);
+    }
+
+    /// 回归：解析不出会话键时（cwd 探测抖动等）**不得**当作换会话——
+    /// 那会丢掉内存里的账本，而 `stale_key` 还会阻止它被重新采纳。
+    #[test]
+    fn unresolvable_key_must_not_be_treated_as_a_session_change() {
+        let mut runtime = Runtime::new_isolated();
+        runtime.set_session_key_for_test(Some("sess-a"));
+        runtime.state.blocks.push(test_block("b1"));
+        runtime.record_user_input("still session a");
+
+        // 探测失败：返回 None。
+        crate::session::set_key_override(Some(None));
+        runtime.on_session_start("resume", "sess-a");
+
+        assert_eq!(runtime.session_key(), Some("sess-a"), "键不该被清掉");
+        assert_eq!(runtime.state.blocks.len(), 1, "账本不该被丢掉");
+        assert_eq!(runtime.messages.len(), 1, "观测视图不该被清掉");
     }
 }

@@ -313,7 +313,11 @@ pub struct CompressionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub absorbed: Vec<AbsorbRecord>,
     /// 可逆吸收原文的账本（句柄 → 元数据；正文存在 `state/absorbed/<handle>.txt`）。
-    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "absorbedOutputs")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "absorbedOutputs"
+    )]
     pub absorbed_outputs: Vec<AbsorbedOutput>,
     /// 下一个 absorb 句柄计数器。
     #[serde(default, rename = "nextAbsorbId")]
@@ -341,6 +345,34 @@ pub struct CompressionState {
     /// 下一个批次 id。
     #[serde(rename = "nextRunId")]
     pub next_run_id: u64,
+    /// 下一条观测消息的**原始 id** 计数器（`msg1` / `msg2` …）。
+    ///
+    /// # 为什么要持久化（上游没有这个字段）
+    ///
+    /// 上游的 `CoreMessage.id` 由**宿主**提供，天然全局唯一。本扩展拿不到宿主
+    /// 消息 id，只能用自增计数器造一个（[`crate::runtime::Runtime`] 的 `next_id`）。
+    /// 计数器不落盘的话，进程重启后从 1 重新数，新消息就会拿到**已经用过的**
+    /// 原始 id；而 [`crate::refs::assign_refs`] 见到 `byRaw` 里已有该 id 就跳过
+    /// 分配（「首次分配后永不重分配」），于是新消息默默继承了旧消息的 ref——
+    /// 模型按 ref 压缩时压到的是另一段内容。
+    ///
+    /// 默认 1：老状态文件没有这个字段。
+    #[serde(
+        default = "default_one",
+        skip_serializing_if = "is_one",
+        rename = "nextMessageSeq"
+    )]
+    pub next_message_seq: u64,
+}
+
+/// serde 默认值：1。
+fn default_one() -> u64 {
+    1
+}
+
+/// 跳过序列化初值（与上游字段集对齐，不无谓放大状态文件）。
+fn is_one(value: &u64) -> bool {
+    *value <= 1
 }
 
 /// 层级配置。
