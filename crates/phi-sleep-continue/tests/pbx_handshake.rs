@@ -17,7 +17,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_phi-sleep-continue");
 const EXTENSION_NAME: &str = "phi-sleep-continue";
 
 /// 期望注册的斜杠命令。
-const EXPECTED_COMMANDS: &[&str] = &["sleep-on", "sleep-off", "sleep-set", "sleep-max", "sleep-status", "sleep-approval"];
+const EXPECTED_COMMANDS: &[&str] = &[
+    "sleep-on",
+    "sleep-off",
+    "sleep-set",
+    "sleep-max",
+    "sleep-status",
+    "sleep-approval",
+];
 
 /// 期望注册的 LLM 工具。
 const EXPECTED_TOOLS: &[&str] = &[];

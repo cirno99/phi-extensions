@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 
 use bumpalo::collections::String as ArenaString;
 use bumpalo::Bump;
-use phi_ext_common::json::{Value, ValueAsMutObject, ValueAsObject, ValueAsScalar, ValueObjectAccess, Writable};
+use phi_ext_common::json::{
+    Value, ValueAsMutObject, ValueAsObject, ValueAsScalar, ValueObjectAccess, Writable,
+};
 
 use crate::config::ApprovalConfig;
 
@@ -199,7 +201,10 @@ pub fn truncate_inline(value: &str, max_chars: usize) -> String {
     if normalized.chars().count() <= max_chars {
         return normalized;
     }
-    let kept: String = normalized.chars().take(max_chars.saturating_sub(1)).collect();
+    let kept: String = normalized
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect();
     format!("{kept}…")
 }
 
@@ -678,7 +683,12 @@ mod tests {
     use phi_ext_common::json::json;
 
     fn config() -> ApprovalConfig {
-        ApprovalConfig::default()
+        // 默认配置为 enabled + permissive；单测统一用 safe 模式验证路由规则。
+        ApprovalConfig {
+            enabled: true,
+            mode: ApprovalMode::Safe,
+            ..ApprovalConfig::default()
+        }
     }
 
     /// 用一次性竞技场跑一次审批判定，返回路由与结论。
@@ -762,7 +772,12 @@ mod tests {
 
     #[test]
     fn safe_read_only_commands_should_be_allowed() {
-        for command in ["pwd", "git status", "git log --oneline", "git branch --show-current"] {
+        for command in [
+            "pwd",
+            "git status",
+            "git log --oneline",
+            "git branch --show-current",
+        ] {
             let (route, decision) = eval(
                 "bash",
                 &json!({ "command": command }),
@@ -792,7 +807,10 @@ mod tests {
                 &config(),
                 &ApprovalStore::default(),
             );
-            assert!(matches!(decision, Decision::Deny(_)), "command {command} 应被阻止");
+            assert!(
+                matches!(decision, Decision::Deny(_)),
+                "command {command} 应被阻止"
+            );
         }
     }
 
@@ -930,7 +948,10 @@ mod tests {
     fn stable_stringify_should_sort_keys() {
         let scratch = Scratch::with_capacity(128);
         let arena = scratch.arena();
-        assert_eq!(stable_stringify(arena, &json!({"b": 1, "a": 2})), r#"{"a":2,"b":1}"#);
+        assert_eq!(
+            stable_stringify(arena, &json!({"b": 1, "a": 2})),
+            r#"{"a":2,"b":1}"#
+        );
         assert_eq!(
             stable_stringify(arena, &json!({"a": 2, "b": 1})),
             stable_stringify(arena, &json!({"b": 1, "a": 2}))
@@ -968,7 +989,11 @@ mod tests {
     fn action_hash_should_depend_on_cwd_and_extra_fields() {
         let base = subject("bash", &json!({"command": "git status"}), "/w");
         let other_cwd = subject("bash", &json!({"command": "git status"}), "/other");
-        let with_timeout = subject("bash", &json!({"command": "git status", "timeout": 5}), "/w");
+        let with_timeout = subject(
+            "bash",
+            &json!({"command": "git status", "timeout": 5}),
+            "/w",
+        );
         assert_ne!(base.action_hash, other_cwd.action_hash);
         assert_ne!(base.action_hash, with_timeout.action_hash);
     }
@@ -978,7 +1003,11 @@ mod tests {
         let with_path = subject("read", &json!({"path": "src/a.rs"}), "/w");
         assert_eq!(with_path.action_summary, "read: src/a.rs");
         let without_path = subject("web_fetch", &json!({"url": "https://x"}), "/w");
-        assert!(without_path.action_summary.starts_with("web_fetch: "), "got {}", without_path.action_summary);
+        assert!(
+            without_path.action_summary.starts_with("web_fetch: "),
+            "got {}",
+            without_path.action_summary
+        );
     }
 
     #[test]

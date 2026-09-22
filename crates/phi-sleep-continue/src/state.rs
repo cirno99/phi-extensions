@@ -18,10 +18,18 @@ use phi_ext_common::json::{Value, ValueAsArray, ValueAsScalar, ValueObjectAccess
 use crate::approval::{ApprovalStore, Route};
 use crate::config::{self, ApprovalConfig};
 
-/// 默认自动继续文本。
+/// 默认自动继续文本（作为「任务指令」追加在固定触发行之后）。
 pub const DEFAULT_CONTINUE_TEXT: &str = "继续";
 /// 默认迭代上限。
 pub const DEFAULT_MAX: u32 = 100;
+/// 固定触发行：语义永不缺席，负责告诉模型「何时调用 `stop_sleep` 收尾」。
+///
+/// 参照 pi-extension-watchdog 的固定触发行设计：用户自定义的继续文本只作为
+/// 「任务指令」追加在其后，不会替换本行语义，从而避免无人值守在任务完成后
+/// 仍被无限催促。
+pub const TRIGGER_LINE: &str = "【自动催促·非用户输入】若任务尚未完成，请直接继续执行，无需回复本条；若任务已完成，或需要等待用户决策，请不要再改动，用一句话说明后调用 stop_sleep 结束本轮。";
+/// 携带重试原因时的固定前缀（用于区分插件注入与真实用户输入）。
+pub const RETRY_PREFIX: &str = "上次运行遇到问题：";
 
 /// 需要自动使用推荐选项的提问类工具名。
 pub fn question_tool_names() -> BTreeSet<&'static str> {
@@ -45,8 +53,12 @@ pub struct SleepState {
     pub consecutive_errors: u32,
     /// 待重试的原因（由 `tool_result` 收集）。
     pub pending_retry_reason: Option<String>,
-    /// 上次活动时间戳（Unix 毫秒）。
-    pub last_activity_ms: u64,
+    /// 常驻模式：`stop_sleep` 只把监控挂起，用户下一条真实输入自动恢复。
+    pub keep_alive: bool,
+    /// 常驻模式下被 `stop_sleep` 挂起（下一条用户输入可唤醒）。
+    pub suspended: bool,
+    /// `stop_sleep` 已被调用，等待 `turn_stopping` 消费后结束本轮。
+    pub stop_requested: bool,
     /// 当前会话 ID（由 `subscribe(SessionStart)` 记录）。
     pub session_id: String,
     /// 自动审批配置（持久化在 `~/.phi/extensions/phi-sleep-continue/config.json`）。
@@ -72,7 +84,9 @@ impl Default for SleepState {
             max: DEFAULT_MAX,
             consecutive_errors: 0,
             pending_retry_reason: None,
-            last_activity_ms: now_ms(),
+            keep_alive: false,
+            suspended: false,
+            stop_requested: false,
             session_id: String::new(),
             approval: ApprovalConfig::default(),
             config_path: config::config_path(),
@@ -128,7 +142,11 @@ impl SleepState {
             .map_or("无".to_string(), |subject| subject.action_summary.clone());
         format!(
             "自动审批：{}（模式 {}）· 最近路由 {} · 已批准 {} · 连续拒绝 {} · 待放行 {}",
-            if self.approval.enabled { "开 ✅" } else { "关 ❌" },
+            if self.approval.enabled {
+                "开 ✅"
+            } else {
+                "关 ❌"
+            },
             mode,
             route,
             self.approval_store.approved_count(),
@@ -137,25 +155,62 @@ impl SleepState {
         )
     }
 
-    /// 记录一次活动。
-    pub fn touch(&mut self) {
-        self.last_activity_ms = now_ms();
-    }
-
     /// 人手接管后重置预算。
     pub fn reset_budget(&mut self) {
         self.count = 0;
         self.consecutive_errors = 0;
         self.pending_retry_reason = None;
+        self.stop_requested = false;
     }
 
     /// 开关状态的一行 footer 摘要。
     pub fn footer(&self) -> String {
-        if self.enabled {
-            format!("\u{1F319} 自动继续 {}/{}", self.count, self.max)
-        } else {
-            String::new()
+        if !self.enabled {
+            return String::new();
         }
+        if self.suspended {
+            format!("\u{1F319} 自动继续已挂起 {}/{}", self.count, self.max)
+        } else {
+            format!("\u{1F319} 自动继续 {}/{}", self.count, self.max)
+        }
+    }
+
+    /// 组装一次自动催促的消息：固定触发行 + 用户追加的任务指令。
+    ///
+    /// 触发行永不缺席，负责告诉模型何时调用 `stop_sleep` 收尾；用户自定义的
+    /// 继续文本只作为「任务指令」追加，不替换触发行语义。
+    pub fn nudge_message(&self) -> String {
+        format!("{TRIGGER_LINE}\n任务指令：{}", self.continue_text)
+    }
+
+    /// 记录一次 `stop_sleep` 调用，等待 `turn_stopping` 消费。
+    pub fn request_stop(&mut self) {
+        self.stop_requested = true;
+    }
+
+    /// `turn_stopping` 消费 `stop_sleep`。返回 `true` 表示本轮应直接结束。
+    ///
+    /// 常驻模式下仅挂起（等待下一条用户输入恢复）；非常驻模式彻底关闭。
+    pub fn consume_stop(&mut self) -> bool {
+        if !self.stop_requested {
+            return false;
+        }
+        self.stop_requested = false;
+        self.pending_retry_reason = None;
+        if self.keep_alive {
+            self.suspended = true;
+        } else {
+            self.enabled = false;
+        }
+        true
+    }
+
+    /// 真实用户输入接管：清除常驻挂起、重置预算。返回是否由挂起恢复。
+    pub fn take_user_over(&mut self) -> bool {
+        let resumed = self.suspended;
+        self.suspended = false;
+        self.reset_budget();
+        resumed
     }
 }
 
@@ -170,9 +225,6 @@ pub type Shared = std::rc::Rc<std::cell::RefCell<SleepState>>;
 pub fn shared() -> Shared {
     std::rc::Rc::new(std::cell::RefCell::new(SleepState::from_env()))
 }
-
-/// 当前 Unix 毫秒时间戳（复用共享实现）。
-pub use phi_ext_common::time::now_ms;
 
 /// 判断文本里是否出现某个恰好三位的状态码（`429` / `5xx` 等）。
 ///
@@ -240,7 +292,18 @@ pub fn is_retryable(text: &str) -> bool {
     if NEEDLES.iter().any(|needle| lower.contains(needle)) {
         return true;
     }
-    const CJK: &[&str] = &["暂时", "稍后", "重试", "失败", "中断", "无响应", "假死"];
+    // 仅保留“确实值得重试”的瞬时故障中文提示；「失败」「中断」等泛指
+    // 太宽，会把普通业务错误也误判为可重试。
+    const CJK: &[&str] = &[
+        "暂时",
+        "稍后",
+        "重试",
+        "超时",
+        "无响应",
+        "假死",
+        "连接中断",
+        "连接重置",
+    ];
     CJK.iter().any(|needle| text.contains(needle))
 }
 
@@ -393,5 +456,67 @@ mod tests {
         assert!(!state.enabled);
         assert_eq!(state.continue_text, DEFAULT_CONTINUE_TEXT);
         assert_eq!(state.max, DEFAULT_MAX);
+        assert!(!state.keep_alive);
+        assert!(!state.suspended);
+    }
+
+    #[test]
+    fn nudge_message_should_keep_trigger_line_and_append_instruction() {
+        let state = SleepState {
+            continue_text: "按计划推进".into(),
+            ..SleepState::default()
+        };
+        let message = state.nudge_message();
+        assert!(message.starts_with(TRIGGER_LINE));
+        assert!(message.contains("任务指令：按计划推进"));
+    }
+
+    #[test]
+    fn consume_stop_should_disable_in_once_mode() {
+        let mut state = SleepState {
+            enabled: true,
+            count: 3,
+            pending_retry_reason: Some("x".into()),
+            ..SleepState::default()
+        };
+        state.request_stop();
+        assert!(state.consume_stop());
+        assert!(!state.enabled);
+        assert!(!state.suspended);
+        assert!(state.pending_retry_reason.is_none());
+        // 第二次消费不应再返回 true。
+        assert!(!state.consume_stop());
+    }
+
+    #[test]
+    fn consume_stop_should_suspend_in_keep_mode() {
+        let mut state = SleepState {
+            enabled: true,
+            keep_alive: true,
+            ..SleepState::default()
+        };
+        state.request_stop();
+        assert!(state.consume_stop());
+        assert!(state.enabled);
+        assert!(state.suspended);
+        assert!(state.footer().contains("挂起"));
+    }
+
+    #[test]
+    fn take_user_over_should_resume_and_reset() {
+        let mut state = SleepState {
+            enabled: true,
+            keep_alive: true,
+            suspended: true,
+            count: 4,
+            ..SleepState::default()
+        };
+        assert!(state.take_user_over());
+        assert!(!state.suspended);
+        assert_eq!(state.count, 0);
+        // 未挂起时返回 false，但仍会重置预算。
+        state.count = 2;
+        assert!(!state.take_user_over());
+        assert_eq!(state.count, 0);
     }
 }

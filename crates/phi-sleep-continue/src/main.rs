@@ -9,6 +9,13 @@
 //   phi 只在「本轮无工具调用、即将结束」时给一次转向机会，正好对应
 //   pi 的 `agent_settled`。
 //
+// 另参照 pi-extension-watchdog（https://github.com/GreenHatHG/pi-extension-watchdog）
+// 补齐「任务完成即收尾」的能力：
+// - 固定触发行（`state::TRIGGER_LINE`）+ 用户任务指令，避免自定义文本冲淡语义；
+// - `stop_sleep` 工具（`tools.rs`）：AI 主动结束/挂起本轮，解决仅靠上限判断
+//   不了「任务是否真的完成」而反复空催的问题；
+// - `mode=keep` 常驻模式：`stop_sleep` 只挂起，用户下一条真实输入自动恢复。
+//
 // 受 phi 宿主能力限制而无法移植的部分（详见 PLAN.md）：
 // - 看门狗 + `ctx.abort()`：phi 无 abort RPC，也无定时器回调。
 // - 指数退避 `await sleep(delay)`：`turn_stopping` 是同步回调，无法在两次
@@ -26,6 +33,7 @@ mod approval;
 mod commands;
 mod config;
 mod state;
+mod tools;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -48,6 +56,7 @@ fn main() -> Result<(), phi::Error> {
     let scratch = Rc::new(RefCell::new(Scratch::with_capacity(4 * 1024)));
 
     commands::register(&mut ext, shared.clone());
+    tools::register(&mut ext, shared.clone());
     register_tool_call(&mut ext, shared.clone(), scratch);
     register_tool_result(&mut ext, shared.clone());
     register_turn_stopping(&mut ext, shared.clone());
@@ -71,8 +80,12 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared, scratch: Rc<RefC
     let question_tools = state::question_tool_names();
     ext.on_tool_call(move |ev| {
         let mut guard = shared.borrow_mut();
-        guard.touch();
         if !guard.enabled {
+            return None;
+        }
+
+        // `stop_sleep`：AI 主动收尾的控制工具，必须放行，且不受自动审批管辖。
+        if ev.tool_name == tools::STOP_TOOL_NAME {
             return None;
         }
 
@@ -143,8 +156,13 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared, scratch: Rc<RefC
 fn register_tool_result(ext: &mut phi::Extension, shared: Shared) {
     ext.on_tool_result(move |ev| {
         let mut guard = shared.borrow_mut();
-        guard.touch();
-        if !guard.enabled || !ev.is_error {
+        if !guard.enabled {
+            return None;
+        }
+        if !ev.is_error {
+            // 工具成功即视为已恢复，清掉上一次失败的重试说明，
+            // 避免后续催促里夹带已过期的错误信息。
+            guard.pending_retry_reason = None;
             return None;
         }
         let raw = phi_ext_common::json::to_string(&ev.content).unwrap_or_default();
@@ -164,8 +182,14 @@ fn register_tool_result(ext: &mut phi::Extension, shared: Shared) {
 fn register_turn_stopping(ext: &mut phi::Extension, shared: Shared) {
     ext.on_turn_stopping(move |_ev| {
         let mut guard = shared.borrow_mut();
-        guard.touch();
         if !guard.enabled {
+            return None;
+        }
+        // `stop_sleep`：AI 主动收尾（任务完成或需等待用户决策）。
+        if guard.consume_stop() {
+            return None;
+        }
+        if guard.suspended {
             return None;
         }
         if guard.count >= guard.max {
@@ -180,13 +204,14 @@ fn register_turn_stopping(ext: &mut phi::Extension, shared: Shared) {
             Some(reason) => {
                 guard.consecutive_errors += 1;
                 format!(
-                    "上次运行遇到问题：{reason}。请重试上一步操作并{}。",
-                    guard.continue_text
+                    "{}{reason}。请重试上一步操作。\n{}",
+                    state::RETRY_PREFIX,
+                    guard.nudge_message()
                 )
             }
             None => {
                 guard.consecutive_errors = 0;
-                guard.continue_text.clone()
+                guard.nudge_message()
             }
         };
 
@@ -200,23 +225,24 @@ fn register_turn_stopping(ext: &mut phi::Extension, shared: Shared) {
 
 /// 人手输入接管后重置预算。
 ///
-/// phi 的 `UserInputEvent` 没有 `source` 字段，无法区分人手输入与插件注入，
-/// 因此用「文本是否等于我们注入的续跑文本」来判别，避免把自己的注入当成人手输入
-/// 而反复清零计数。
+/// phi 的 `UserInputEvent` 没有 `source` 字段，用「文本是否为我们注入的催促」
+/// 来判别，避免把自己的注入当成人手输入而反复清零计数。`turn_stopping` 的
+/// 转向消息不经过本回调，因此这里见到的多为真实用户输入；常驻模式挂起时
+/// 由真实输入自动恢复。
 fn register_user_input(ext: &mut phi::Extension, shared: Shared) {
     ext.on_user_input(move |ev| {
         let mut guard = shared.borrow_mut();
-        guard.touch();
-        let injected = ev.text == guard.continue_text
-            || ev.text.starts_with("上次运行遇到问题：");
+        let injected = ev.text.starts_with(state::TRIGGER_LINE)
+            || ev.text.starts_with(state::RETRY_PREFIX)
+            || ev.text == guard.continue_text;
         if !injected {
-            guard.reset_budget();
+            guard.take_user_over();
         }
         None
     });
 }
 
-/// 生命周期事件：维护活动时间戳与会话 ID。
+/// 生命周期事件：维护会话 ID 与配置。
 fn register_events(ext: &mut phi::Extension, shared: Shared) {
     {
         let shared = shared.clone();
@@ -225,10 +251,10 @@ fn register_events(ext: &mut phi::Extension, shared: Shared) {
             if !ev.session_id.is_empty() {
                 guard.session_id = ev.session_id;
             }
-            guard.touch();
             guard.reload_config();
             if matches!(ev.reason.as_str(), "new" | "resume" | "fork") {
                 guard.reset_budget();
+                guard.suspended = false;
                 guard.approval_store.clear();
             }
         });
@@ -238,16 +264,6 @@ fn register_events(ext: &mut phi::Extension, shared: Shared) {
         ext.subscribe(pxb::Event::SessionShutdown, move |_ev| {
             let mut guard = shared.borrow_mut();
             guard.session_id.clear();
-        });
-    }
-    for event in [
-        pxb::Event::AgentStart,
-        pxb::Event::AgentEnd,
-        pxb::Event::TurnEnd,
-    ] {
-        let shared = shared.clone();
-        ext.subscribe(event, move |_ev| {
-            shared.borrow_mut().touch();
         });
     }
 }

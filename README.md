@@ -46,11 +46,13 @@ scripts/install.sh --debug  # 构建 debug
 
 | 入口 | 说明 |
 |---|---|
-| `/sleep-on [文本]` `/sleep-off` `/sleep-set <文本>` `/sleep-max <N>` `/sleep-status` | 自动继续 |
-| `/sleep-approval status\|on\|off\|safe\|permissive\|allow <模式>\|deny <模式>\|allowlist <命令>\|approve\|clear\|reset` | 自动审批 |
+| `/sleep-on [文本]` `/sleep-off` `/sleep-set <文本>` `/sleep-max <N>` `/sleep-mode [once\|keep]` `/sleep-status` | 自动继续 |
+| `/sleep-approval status\|on\|off\|safe\|permissive\|allow <模式>\|deny <模式>\|allowlist <命令>\|approve\|clear\|reset` | 自动审批（默认**开**，模式 `permissive`） |
 
 配置：`~/.phi/extensions/phi-sleep-continue/config.json`。
-**注意**：自动审批只在无人值守（`/sleep-on`）开启时生效，避免影响日常交互。
+**说明**：
+- 自动审批默认开启、模式 `permissive`：只拦你显式 `deny` 的动作，不会误伤 `cargo test` 等常用命令；需要更紧的护栏时用 `/sleep-approval safe`。
+- 每次催促带固定触发行（告诉模型「任务完成后调用 `stop_sleep` 收尾」），用户文本作为「任务指令」追加；`stop_sleep` 在 `once` 模式彻底关闭、在 `keep` 模式仅挂起（下一条真实输入自动恢复）。
 
 ### cache-optimizer
 

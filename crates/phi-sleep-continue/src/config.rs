@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use phi_ext_common::json::{Value, ValueAsArray, ValueAsScalar, ValueObjectAccess};
+use serde::{Deserialize, Serialize};
 
 use phi_ext_common::config::{load_strict, save_atomic, to_bool, to_enum, to_int, ConfigError};
 use phi_ext_common::paths;
@@ -31,8 +31,13 @@ pub enum ApprovalMode {
 #[serde(default, rename_all = "camelCase")]
 pub struct ApprovalConfig {
     /// 是否启用自动审批路由（仅在无人值守模式开启时生效）。
+    ///
+    /// 默认开启、且模式为 `permissive`：无人值守时只按名单兜底，不拦未显式
+    /// `deny` 的动作；需要更紧的护栏时用 `/sleep-approval safe`。
     pub enabled: bool,
     /// 审批模式。
+    ///
+    /// 默认 `permissive`（宽松兜底）；`safe` 只放行可证明安全的动作。
     pub mode: ApprovalMode,
     /// 连续拒绝多少次后，提示模型停下来向用户求助。
     pub max_consecutive_denials: u32,
@@ -44,15 +49,53 @@ pub struct ApprovalConfig {
     pub deny: Vec<String>,
 }
 
+/// 内置默认阻止名单。
+///
+/// 只列「明显破坏性 / 不可逆」的动作，且尽量用精确匹配（无 `*` 时匹配
+/// 「命令本身」或「命令 + 空格前缀」），避免误伤正常命令；需要 `*` 的只有
+/// `mkfs*`（真实命令形如 `mkfs.ext4`）。用户可在 `deny` 里追加或删除。
+pub const DEFAULT_DENY: &[&str] = &[
+    // 删除 / 覆盖
+    "rm",
+    "rmdir",
+    "shred",
+    // 提权
+    "sudo",
+    "doas",
+    "su",
+    // 分区 / 格式化 / 块设备写入
+    "mkfs*",
+    "fdisk",
+    "parted",
+    "mkswap",
+    "dd",
+    // 电源 / 服务 / 定时任务
+    "shutdown",
+    "reboot",
+    "poweroff",
+    "halt",
+    "systemctl",
+    "crontab",
+    // 属主变更
+    "chown",
+    // 历史重写
+    "git reset",
+    "git clean",
+    // 进程
+    "kill",
+    "pkill",
+    "killall",
+];
+
 impl Default for ApprovalConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            mode: ApprovalMode::Safe,
+            mode: ApprovalMode::Permissive,
             max_consecutive_denials: 3,
             safe_command_allowlist: Vec::new(),
             allow: Vec::new(),
-            deny: Vec::new(),
+            deny: DEFAULT_DENY.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
@@ -90,7 +133,11 @@ pub fn normalize(raw: &Value) -> ApprovalConfig {
         ) as u32,
         safe_command_allowlist: strings(raw.get("safeCommandAllowlist")),
         allow: strings(raw.get("allow")),
-        deny: strings(raw.get("deny")),
+        // `deny` 缺失时回落到内置默认名单（用户显式写 `[]` 则清空）。
+        deny: match raw.get("deny") {
+            Some(_) => strings(raw.get("deny")),
+            None => defaults.deny.clone(),
+        },
     }
 }
 
@@ -123,12 +170,25 @@ mod tests {
     use phi_ext_common::json::json;
 
     #[test]
-    fn defaults_should_be_safe_and_enabled() {
+    fn defaults_should_be_enabled_and_permissive() {
         let config = ApprovalConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.mode, ApprovalMode::Safe);
+        assert_eq!(config.mode, ApprovalMode::Permissive);
         assert_eq!(config.max_consecutive_denials, 3);
         assert!(config.safe_command_allowlist.is_empty());
+        assert!(config.deny.contains(&"rm".to_string()));
+        // `git push` 已从默认名单放开（无人值守常需要自动推分支）。
+        assert!(!config.deny.contains(&"git push".to_string()));
+    }
+
+    #[test]
+    fn normalize_should_fall_back_to_default_deny_when_key_missing() {
+        // 缺 `deny` 键 → 用内置默认名单。
+        let config = normalize(&json!({ "mode": "permissive" }));
+        assert_eq!(config.deny, ApprovalConfig::default().deny);
+        // 显式 `[]` → 用户主动清空。
+        let cleared = normalize(&json!({ "deny": [] }));
+        assert!(cleared.deny.is_empty());
     }
 
     #[test]
@@ -156,7 +216,7 @@ mod tests {
             "maxConsecutiveDenials": 0,
             "safeCommandAllowlist": ["ok", 42, null]
         }));
-        assert_eq!(config.mode, ApprovalMode::Safe);
+        assert_eq!(config.mode, ApprovalMode::Permissive);
         assert_eq!(config.max_consecutive_denials, 1);
         assert_eq!(config.safe_command_allowlist, vec!["ok"]);
     }

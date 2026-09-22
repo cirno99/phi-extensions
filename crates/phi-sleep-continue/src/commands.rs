@@ -18,6 +18,7 @@ pub fn register(ext: &mut phi::Extension, shared: Shared) {
     register_off(ext, shared.clone());
     register_set(ext, shared.clone());
     register_max(ext, shared.clone());
+    register_mode(ext, shared.clone());
     register_status(ext, shared.clone());
     register_approval(ext, shared);
 }
@@ -42,8 +43,8 @@ fn register_on(ext: &mut phi::Extension, shared: Shared) {
                         state.continue_text = text.to_string();
                     }
                     state.enabled = true;
+                    state.suspended = false;
                     state.reset_budget();
-                    state.touch();
                     (
                         state.footer(),
                         state.continue_text.clone(),
@@ -54,7 +55,7 @@ fn register_on(ext: &mut phi::Extension, shared: Shared) {
                 ctx.notify(
                     "info",
                     &format!(
-                        "\u{1F319} 自动继续已开启：每次 settled 后发送“{continue_text}”（上限 {max} 次）"
+                        "\u{1F319} 自动继续已开启：任务指令“{continue_text}”（上限 {max} 次，完成后 AI 可调用 stop_sleep 收尾）"
                     ),
                 );
                 Ok(())
@@ -71,6 +72,8 @@ fn register_off(ext: &mut phi::Extension, shared: Shared) {
             {
                 let mut state = shared.borrow_mut();
                 state.enabled = false;
+                state.suspended = false;
+                state.stop_requested = false;
                 state.pending_retry_reason = None;
             }
             refresh(ctx, &shared);
@@ -99,8 +102,8 @@ fn register_set(ext: &mut phi::Extension, shared: Shared) {
                     let mut state = shared.borrow_mut();
                     state.continue_text = text.to_string();
                     state.enabled = true;
+                    state.suspended = false;
                     state.reset_budget();
-                    state.touch();
                     (state.footer(), state.continue_text.clone())
                 };
                 ctx.set_status(&footer);
@@ -133,11 +136,71 @@ fn register_max(ext: &mut phi::Extension, shared: Shared) {
                     (state.footer(), state.count)
                 };
                 ctx.set_status(&footer);
-                ctx.notify("info", &format!("\u{1F319} 迭代上限已设为 {max}（当前 {count}/{max}）"));
+                ctx.notify(
+                    "info",
+                    &format!("\u{1F319} 迭代上限已设为 {max}（当前 {count}/{max}）"),
+                );
                 Ok(())
             },
         )
         .needs_args(),
+    );
+}
+
+/// `/sleep-mode [once|keep]` — 设置停止语义。
+///
+/// - `once`（默认）：`stop_sleep` / 达到上限后彻底关闭监控；
+/// - `keep`（常驻）：`stop_sleep` 只把监控挂起，用户下一条真实输入自动恢复。
+fn register_mode(ext: &mut phi::Extension, shared: Shared) {
+    ext.register_command(
+        "sleep-mode",
+        phi::Command::new(
+            "设置停止语义（用法：/sleep-mode [once|keep]）",
+            move |args, ctx| {
+                let arg = args.trim();
+                let keep = match arg {
+                    "" => {
+                        let keep = shared.borrow().keep_alive;
+                        ctx.notify(
+                            "info",
+                            &format!(
+                                "\u{1F319} 当前模式：{}（once=收尾后彻底关闭；keep=收尾后挂起，下一条消息自动恢复）",
+                                if keep { "keep（常驻）" } else { "once" }
+                            ),
+                        );
+                        return Ok(());
+                    }
+                    "once" => false,
+                    "keep" => true,
+                    _ => {
+                        ctx.notify("warning", "用法：/sleep-mode [once|keep]");
+                        return Ok(());
+                    }
+                };
+                let footer = {
+                    let mut state = shared.borrow_mut();
+                    state.keep_alive = keep;
+                    if !keep {
+                        state.suspended = false;
+                    }
+                    state.footer()
+                };
+                ctx.set_status(&footer);
+                ctx.notify(
+                    "info",
+                    &format!(
+                        "\u{1F319} 停止语义已设为 {}（{}）",
+                        if keep { "keep（常驻）" } else { "once" },
+                        if keep {
+                            "stop_sleep 后挂起，下一条消息自动恢复"
+                        } else {
+                            "stop_sleep 后彻底关闭"
+                        }
+                    ),
+                );
+                Ok(())
+            },
+        ),
     );
 }
 
@@ -174,7 +237,7 @@ fn register_approval(ext: &mut phi::Extension, shared: Shared) {
 
                 match subcommand {
                     "status" => {
-                        let (summary, path, allow, deny, allowlist) = {
+                        let (summary, path, allow, deny, allowlist, warning) = {
                             let guard = shared.borrow();
                             (
                                 guard.approval_summary(),
@@ -182,6 +245,7 @@ fn register_approval(ext: &mut phi::Extension, shared: Shared) {
                                 guard.approval.allow.clone(),
                                 guard.approval.deny.clone(),
                                 guard.approval.safe_command_allowlist.clone(),
+                                guard.config_warning.clone(),
                             )
                         };
                         let render = |items: &[String]| {
@@ -191,10 +255,13 @@ fn register_approval(ext: &mut phi::Extension, shared: Shared) {
                                 items.join(", ")
                             }
                         };
+                        let warn_line = warning
+                            .map(|warning| format!("\n\u{26A0}\u{FE0F} 配置告警：{warning}"))
+                            .unwrap_or_default();
                         ctx.notify(
                             "info",
                             &format!(
-                                "{summary}\n配置文件：{path}\n放行名单：{}\n阻止名单：{}\n安全命令白名单：{}",
+                                "{summary}\n配置文件：{path}\n放行名单：{}\n阻止名单：{}\n安全命令白名单：{}{warn_line}",
                                 render(&allow),
                                 render(&deny),
                                 render(&allowlist)
@@ -320,9 +387,23 @@ fn register_status(ext: &mut phi::Extension, shared: Shared) {
         "sleep-status",
         phi::Command::new("查看无人值守自动继续状态", move |_args, ctx| {
             let state = shared.borrow();
-            let lines = [
+            let mode = if state.keep_alive {
+                "keep（常驻）"
+            } else {
+                "once"
+            };
+            let mut lines = vec![
                 format!("开关：{}", if state.enabled { "开 ✅" } else { "关 ❌" }),
-                format!("继续文本：“{}”", state.continue_text),
+                format!("模式：{mode}"),
+                format!(
+                    "状态：{}",
+                    if state.suspended {
+                        "已挂起（下一条消息自动恢复）"
+                    } else {
+                        "运行中/未开启"
+                    }
+                ),
+                format!("任务指令：“{}”", state.continue_text),
                 format!("进度：{}/{}", state.count, state.max),
                 format!("连续失败：{}", state.consecutive_errors),
                 format!(
@@ -331,10 +412,16 @@ fn register_status(ext: &mut phi::Extension, shared: Shared) {
                 ),
                 state.approval_summary(),
             ];
+            if let Some(warning) = &state.config_warning {
+                lines.push(format!("\u{26A0}\u{FE0F} 配置告警：{warning}"));
+            }
             let footer = state.footer();
             drop(state);
             ctx.set_status(&footer);
-            ctx.notify("info", &format!("\u{1F319} 睡眠继续状态\n{}", lines.join("\n")));
+            ctx.notify(
+                "info",
+                &format!("\u{1F319} 睡眠继续状态\n{}", lines.join("\n")),
+            );
             Ok(())
         }),
     );
