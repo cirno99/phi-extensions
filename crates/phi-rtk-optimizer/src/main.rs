@@ -57,7 +57,14 @@ fn main() -> Result<(), phi::Error> {
 
 /// 空白折叠 + 按字符截断（对应 pi 的 `trimMessage`）。
 fn trim_message(raw: &str, max_chars: usize) -> String {
-    let clean = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    // 直接折叠进一个 String（避免 split→Vec→join 的中间分配）。
+    let mut clean = String::with_capacity(raw.len());
+    for word in raw.split_whitespace() {
+        if !clean.is_empty() {
+            clean.push(' ');
+        }
+        clean.push_str(word);
+    }
     if clean.chars().count() <= max_chars {
         return clean;
     }
@@ -77,8 +84,7 @@ fn should_inject_source_filter_note(config: &config::RtkIntegrationConfig) -> bo
 }
 
 /// 把改写后的命令写回工具入参 JSON。
-fn with_command(input: &Value, command: &str) -> Option<Vec<u8>> {
-    let mut input = input.clone();
+fn with_command(mut input: Value, command: &str) -> Option<Vec<u8>> {
     let object = input.as_object_mut()?;
     let _ = object.insert("command".to_string(), Value::String(command.to_string()));
     phi_ext_common::json::to_vec(&input).ok()
@@ -114,7 +120,7 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
         guard.ensure_status_fresh();
         if guard.should_skip_when_rtk_missing() {
             return (next_command != command)
-                .then(|| with_command(&input, &next_command))
+                .then(move || with_command(input, &next_command))
                 .flatten()
                 .map(|input| phi::ToolCallResult {
                     input: Some(input),
@@ -135,7 +141,7 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
                 ));
             }
             return (next_command != command)
-                .then(|| with_command(&input, &next_command))
+                .then(move || with_command(input, &next_command))
                 .flatten()
                 .map(|input| phi::ToolCallResult {
                     input: Some(input),
@@ -153,7 +159,7 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
                     trim_message(&final_command, NOTICE_RESULT_CHARS)
                 ));
             }
-            let rewritten = with_command(&input, &final_command)?;
+            let rewritten = with_command(input, &final_command)?;
             return Some(phi::ToolCallResult {
                 input: Some(rewritten),
                 ..Default::default()
@@ -169,7 +175,7 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Shared) {
             guard.push_notice(format!("RTK suggestion: {}", decision.rewritten_command));
         }
         (next_command != command)
-            .then(|| with_command(&input, &next_command))
+            .then(move || with_command(input, &next_command))
             .flatten()
             .map(|input| phi::ToolCallResult {
                 input: Some(input),
@@ -263,7 +269,7 @@ mod tests {
     #[test]
     fn with_command_should_replace_only_command_field() {
         let input = json!({ "command": "ls", "timeout": 5 });
-        let bytes = with_command(&input, "rtk ls").expect("应序列化成功");
+        let bytes = with_command(input, "rtk ls").expect("应序列化成功");
         let value = phi_ext_common::json::value(&bytes).expect("应反序列化成功");
         assert_eq!(value["command"], json!("rtk ls"));
         assert_eq!(value["timeout"], json!(5));
@@ -271,7 +277,7 @@ mod tests {
 
     #[test]
     fn with_command_should_reject_non_object_input() {
-        assert!(with_command(&json!([1, 2]), "x").is_none());
+        assert!(with_command(json!([1, 2]), "x").is_none());
     }
 
     #[test]

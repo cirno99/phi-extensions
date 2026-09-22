@@ -1,5 +1,6 @@
 target/
 .pi-github-repos/
+.github/
 .consult/
 *.swp
 .DS_Store

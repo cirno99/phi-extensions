@@ -7,6 +7,7 @@
 // 明确说 token 计数持久化就是为了「diagnostics and session lifecycle
 // extensions」）。因此扩展可以直接读该文件，无需宿主新增钩子。
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -68,11 +69,32 @@ pub fn session_file_path(cwd: &str, session_id: &str) -> Option<PathBuf> {
     None
 }
 
+thread_local! {
+    /// 上次解析的会话用量缓存：路径 + mtime + 结果。
+    ///
+    /// `stats` 是低频命令，但同一文件在一轮内可能被连续读取；用 mtime 做门槛
+    /// 可以跳过无变化时的整段 JSONL 解析。
+    static CACHE: RefCell<Option<(PathBuf, Option<std::time::SystemTime>, UsageReport)>> =
+        const { RefCell::new(None) };
+}
+
 /// 读取当前会话的用量报告；文件缺失或不可读时返回 `None`。
 pub fn load(cwd: &str, session_id: &str) -> Option<UsageReport> {
     let path = session_file_path(cwd, session_id)?;
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if let Some(report) = CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(p, m, _)| p == &path && *m == mtime)
+            .map(|(_, _, report)| *report)
+    }) {
+        return Some(report);
+    }
     let contents = std::fs::read_to_string(&path).ok()?;
-    Some(parse_session(&contents))
+    let report = parse_session(&contents);
+    CACHE.with(|cache| *cache.borrow_mut() = Some((path, mtime, report)));
+    Some(report)
 }
 
 /// 汇总 JSONL 会话文本里的 usage（无法识别的行直接跳过）。

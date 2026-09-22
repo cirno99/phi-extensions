@@ -37,6 +37,8 @@ pub struct State {
     pub config: Config,
     /// 配置文件路径。
     pub config_path: PathBuf,
+    /// 上次读取配置文件的 mtime（用于跳过无变化的重复解析）。
+    config_mtime: Option<std::time::SystemTime>,
     /// 配置加载告警（若有）。
     pub warning: Option<String>,
     /// 本会话是否已注入过完整锚点。
@@ -51,9 +53,13 @@ pub struct State {
 
 impl State {
     fn new(config: Config, config_path: PathBuf, warning: Option<String>) -> Self {
+        let config_mtime = std::fs::metadata(&config_path)
+            .and_then(|m| m.modified())
+            .ok();
         Self {
             config,
             config_path,
+            config_mtime,
             warning,
             anchor_injected: false,
             turns: 0,
@@ -62,11 +68,21 @@ impl State {
         }
     }
 
-    /// 重新载入配置。
+    /// 重新载入配置（仅当文件确实变化时才解析）。
+    ///
+    /// `before_agent_start` 每轮都会调用本方法，以便 `/deepseek` 中途改配置即时生效；
+    /// 但每次都读盘+解析是白费——用 mtime 做门槛，未变就跳过。
     pub fn reload_config(&mut self) {
+        let mtime = std::fs::metadata(&self.config_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime == self.config_mtime {
+            return;
+        }
         let (config, warning) = config::load(&self.config_path);
         self.config = config;
         self.warning = warning;
+        self.config_mtime = mtime;
     }
 
     /// 新会话开始：重置锚点与计数。

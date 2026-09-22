@@ -1,0 +1,19 @@
+[package]
+name = "phi-ast-grep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AST 感知的代码搜索与改写——phi 扩展（pi 版 pi-ast-grep 的 Rust 移植）"
+
+[[bin]]
+name = "phi-ast-grep"
+path = "src/main.rs"
+
+[dependencies]
+phi-ext.workspace = true
+phi-ext-common.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+# 反模式提示（pattern-hints）需要正则匹配
+regex.workspace = true

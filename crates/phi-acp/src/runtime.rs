@@ -26,6 +26,8 @@ pub struct Runtime {
     pub state: CompressionState,
     /// 观测到的消息视图。
     pub messages: Vec<CoreMessage>,
+    /// 观测视图的 token 总数（增量维护，避免每次全量重算）。
+    view_tokens: u64,
     /// 进行中的工具调用：toolCallId → 消息 id。
     active_tool_calls: HashMap<String, String>,
     /// 连续提醒次数（防止死循环）。
@@ -86,6 +88,7 @@ impl Runtime {
             config,
             state,
             messages: Vec::new(),
+            view_tokens: 0,
             active_tool_calls: HashMap::new(),
             consecutive_nudges: 0,
             pending_notices: Vec::new(),
@@ -174,6 +177,7 @@ impl Runtime {
     /// 记录一条用户输入。
     pub fn record_user_input(&mut self, text: &str) {
         let id = self.next_id();
+        self.view_tokens += crate::tokenize::count_tokens(text);
         self.messages
             .push(CoreMessage::text(id, Role::User, text.to_string()));
     }
@@ -181,6 +185,7 @@ impl Runtime {
     /// 记录一次工具调用。
     pub fn record_tool_call(&mut self, tool_call_id: &str, tool_name: &str, input: &str) {
         let id = self.next_id();
+        self.view_tokens += crate::tokenize::count_tokens(input);
         self.active_tool_calls
             .insert(tool_call_id.to_string(), id.clone());
         self.messages.push(CoreMessage {
@@ -231,7 +236,7 @@ impl Runtime {
         } else {
             raw_usage
         };
-        let config = self.config.to_kernel_config().absorb.unwrap_or_default();
+        let config = self.config.to_absorb_config();
         // 预览句柄：stub 里带上它，模型可用 `acp_decompress <handle>` 取回原文。
         // 只有真正命中吸收时才提交计数器（未命中既不落盘、也不在内存里留下空洞）。
         let handle = crate::state::peek_absorb_id(&self.state);
@@ -260,6 +265,7 @@ impl Runtime {
         };
 
         let id = self.next_id();
+        self.view_tokens += crate::tokenize::count_tokens(&text);
         self.messages.push(CoreMessage {
             id,
             role: Role::Tool,
@@ -305,10 +311,7 @@ impl Runtime {
 
     /// 估算当前观测视图的 token 数。
     pub fn estimate_tokens(&self) -> u64 {
-        self.messages
-            .iter()
-            .map(crate::tokenize::count_message_tokens)
-            .sum()
+        self.view_tokens
     }
 
     /// 生效的上下文 token 数：优先取宿主会话文件里的真实值，回退到本地估算。
@@ -360,10 +363,10 @@ impl Runtime {
     pub fn apply(&mut self, ranges: &[CompressRangeSpec]) -> crate::types::ApplyCompressionOutcome {
         let config = self.kernel_config();
         let before = self.state.blocks.len();
-        let outcome =
+        let mut outcome =
             compress::apply_compression(ranges, &self.messages, &self.state, &config, None);
         if outcome.result.blocks_created > 0 {
-            self.state = outcome.state.clone();
+            self.state = std::mem::take(&mut outcome.state);
             let summary = compress::created_blocks_summary(&self.state, before);
             if !summary.is_empty() {
                 self.pending_notices.push(summary);
@@ -487,6 +490,7 @@ impl Runtime {
     /// ref 是每会话的：新会话的消息从 `m00001` 重新编号，与它自己的块账本对齐。
     fn reset_view(&mut self) {
         self.messages.clear();
+        self.view_tokens = 0;
         self.active_tool_calls.clear();
         self.consecutive_nudges = 0;
         self.contract_injected = false;
@@ -557,6 +561,7 @@ impl Runtime {
     /// 清空观测视图与压缩状态。
     pub fn reset_session(&mut self) {
         self.messages.clear();
+        self.view_tokens = 0;
         self.active_tool_calls.clear();
         self.state = crate::state::create_initial_state();
         // 块账本连同可逆吸收的原文一起丢弃：`/acp reset` 的语义就是「忘掉一切」。
@@ -586,6 +591,7 @@ impl Runtime {
     /// 避免与历史块里的旧 ref 撞号。
     pub fn on_host_compaction(&mut self) {
         self.messages.clear();
+        self.view_tokens = 0;
         self.active_tool_calls.clear();
         self.state.token_snapshot.clear();
         // 契约可能已随被摘要的旧历史一起消失，下个 agent start 重新注入一次。

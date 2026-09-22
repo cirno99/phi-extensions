@@ -125,6 +125,9 @@ fn register_compress(ext: &mut phi::Extension, shared: Shared) {
             if !guard.config.enabled {
                 return Err(format!("{EXTENSION_NAME} is disabled"));
             }
+            // 先同步一次内核状态：提醒关闭时 `turn_stopping` 不再每轮 `process()`，
+            // 而 ref 分配 / 块同步正是在 `process()` 里做的——compress 必须自己保证。
+            guard.process();
             let before = guard.state.blocks.len();
             let outcome = guard.apply(&ranges);
             let summary = crate::compress::created_blocks_summary(&guard.state, before);

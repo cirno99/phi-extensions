@@ -236,7 +236,8 @@ fn split_simple_commands(command: &str) -> Option<Vec<String>> {
 
 /// 按 shell 引号/转义规则分词；引号未闭合时返回 `None`。
 fn tokenize_simple_command(command: &str) -> Option<Vec<String>> {
-    let mut tokens: Vec<String> = Vec::new();
+    // 预分配：按空白数估算词数，避免审批热路径上 Vec 反复扩容。
+    let mut tokens: Vec<String> = Vec::with_capacity(command.split_whitespace().count() + 1);
     let mut current = String::new();
     let mut quote: Option<char> = None;
     let mut escaped = false;

@@ -70,7 +70,7 @@ fn pending_by_tier(
     };
     out.insert(1, (effective.iter().map(|r| r.tokens).sum(), Vec::new()));
 
-    let active = active_blocks(state);
+    let active: Vec<&CompressionBlock> = active_blocks(state).collect();
     let t1: Vec<CompressionBlock> = active
         .iter()
         .filter(|b| b.tier == 1)

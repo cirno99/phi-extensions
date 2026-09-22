@@ -35,7 +35,7 @@ use crate::techniques::{
     command_detection::normalize_command_for_detection,
     git::compact_git_output,
     linter::aggregate_linter_output,
-    search::group_search_results,
+    search::{group_search_results, is_search_command},
     source::{detect_language, filter_source_code, smart_truncate, FilterLevel},
     test_output::aggregate_test_output,
     truncate::truncate,
@@ -231,6 +231,13 @@ fn compact_bash_text<'a>(
             &mut state,
             |t| aggregate_linter_output(arena, t, normalized_command),
             "linter",
+        );
+    }
+    if compaction.group_search_output && is_search_command(normalized_command) {
+        apply_nullable_technique(
+            &mut state,
+            |t| group_search_results(arena, t, 50),
+            "search",
         );
     }
 
@@ -811,7 +818,8 @@ pub fn compact_tool_result<'a>(
             let preserve = should_preserve_exact_read_output(content, input, config);
             compact_read_text(arena, content, path, config, preserve)
         }
-        "grep" => compact_grep_text(arena, content, config),
+        // ast-grep 的 search 输出与 grep 同为 `path:line[:col]:content`，复用同一分组技术。
+        "grep" | "ast_grep_search" => compact_grep_text(arena, content, config),
         _ => return CompactionOutcome::unchanged(content),
     };
 
@@ -922,6 +930,24 @@ mod tests {
     fn grep_output_should_be_grouped() {
         let content = "src/a.rs:1:let x = 1;\nsrc/a.rs:2:let y = 2;";
         let outcome = compact("grep", &json!({ "pattern": "let" }), content);
+        assert!(outcome.changed);
+        assert_eq!(outcome.techniques, vec!["search".to_string()]);
+        assert!(outcome.text.contains("2 matches in 1 files:"));
+    }
+
+    #[test]
+    fn ast_grep_search_output_should_be_grouped() {
+        let content = "src/a.rs:1:5:let x = 1;\nsrc/a.rs:2:5:let y = 2;";
+        let outcome = compact("ast_grep_search", &json!({ "pattern": "let" }), content);
+        assert!(outcome.changed);
+        assert_eq!(outcome.techniques, vec!["search".to_string()]);
+        assert!(outcome.text.contains("2 matches in 1 files:"));
+    }
+
+    #[test]
+    fn bash_ast_grep_output_should_be_grouped() {
+        let content = "src/a.rs:1:5:let x = 1;\nsrc/a.rs:2:5:let y = 2;";
+        let outcome = compact("bash", &json!({ "command": "sg -p 'let x' -l rust src" }), content);
         assert!(outcome.changed);
         assert_eq!(outcome.techniques, vec!["search".to_string()]);
         assert!(outcome.text.contains("2 matches in 1 files:"));

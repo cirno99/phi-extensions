@@ -154,6 +154,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "phi-ast-grep"
+version = "0.1.0"
+dependencies = [
+ "phi-ext",
+ "phi-ext-common",
+ "regex",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "phi-cache-optimizer"
 version = "0.1.0"
 dependencies = [

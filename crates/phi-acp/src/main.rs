@@ -58,11 +58,12 @@ fn register_tool_call(ext: &mut phi::Extension, shared: Rc<std::cell::RefCell<Ru
     ext.on_tool_call(move |ev| {
         // 记录所有工具调用（包括本扩展自己的 compress），摘要与 compress 调用是
         // 载重元数据，compress 工具在保护规则里被硬保护。
-        let input = String::from_utf8_lossy(&ev.input).to_string();
         let mut guard = shared.borrow_mut();
         if !guard.config.enabled {
             return None;
         }
+        // 只在真正要记录时才把入参转成字符串（禁用时不做这次分配）。
+        let input = String::from_utf8_lossy(&ev.input);
         guard.record_tool_call(&ev.tool_call_id, &ev.tool_name, &input);
         None
     });
@@ -143,15 +144,17 @@ fn register_turn_stopping(ext: &mut phi::Extension, shared: Rc<std::cell::RefCel
                 return None;
             }
             let auto = guard.config.auto_nudge_enabled;
-            let outcome = guard.process();
             // absorb 统计只在内存里累加（见 `record_tool_result`），这里统一落盘。
             // 放在 `return None` 之前：即使不发提醒，本 turn 的回收量也要持久化，
             // 否则重启后 `/acp status` 的 absorbed 会归零。
             guard.persist_if_dirty();
             if !auto {
-                // 仍要推进状态，但不转向（不阻断宿主压缩、不写永久历史）。
+                // 提醒关闭时不跑内核管线：默认路径上这是最贵的一步（assign_refs /
+                // sync_blocks / prune / recommend 全量扫消息与块），而它的产物只服务
+                // 于提醒；`/acp status` 与 `compress` 工具会各自按需触发 `process()`。
                 return None;
             }
+            let outcome = guard.process();
             let nudge = outcome.nudge.as_ref()?;
             if !nudge.should_inject {
                 return None;

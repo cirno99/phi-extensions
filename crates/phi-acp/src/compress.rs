@@ -859,7 +859,6 @@ fn tier_action_hint(config: &Config, state: &CompressionState) -> String {
         return String::new();
     }
     let t2: Vec<&CompressionBlock> = active_blocks(state)
-        .into_iter()
         .filter(|b| b.tier == 2)
         .collect();
     if t2.len() >= config.tiers.tier3_trigger {
@@ -870,7 +869,6 @@ fn tier_action_hint(config: &Config, state: &CompressionState) -> String {
         );
     }
     let t1: Vec<&CompressionBlock> = active_blocks(state)
-        .into_iter()
         .filter(|b| b.tier == 1)
         .collect();
     if t1.len() >= config.tiers.tier2_trigger {
@@ -1150,20 +1148,20 @@ pub fn process_turn(
 
 /// 状态报告。
 pub fn status(state: &CompressionState, token_count: u64, config: &Config) -> StatusReport {
-    let active = active_blocks(state);
+    let active_count = active_blocks(state).count();
     let usage = if config.model_context_limit > 0 {
         token_count as f64 / config.model_context_limit as f64
     } else {
         0.0
     };
     let mut breakdown = BTreeMap::new();
-    breakdown.insert("active".to_string(), active.len() as u64);
+    breakdown.insert("active".to_string(), active_count as u64);
     breakdown.insert("total".to_string(), state.blocks.len() as u64);
     StatusReport {
         context_usage: usage,
         token_count,
         model_context_limit: config.model_context_limit,
-        active_blocks: active.len(),
+        active_blocks: active_count,
         total_blocks: state.blocks.len(),
         tokens_compressed: state.stats.tokens_compressed,
         breakdown,

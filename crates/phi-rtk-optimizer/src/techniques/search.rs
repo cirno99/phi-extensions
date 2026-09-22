@@ -15,12 +15,26 @@ use regex::Regex;
 
 use phi_ext_common::arena::split_lines;
 
+use super::command_detection::matches_normalized_patterns;
 use super::path_utils::compact_path;
 
 /// `path:line:content` 形式（line 可缺省）。
 static RESULT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(.+?):(\d+)?:(.+)$").expect("搜索结果正则应可编译")
 });
+
+/// ast-grep 搜索命令（CLI 名为 `ast-grep` 或 `sg`）。
+static SEARCH_COMMAND_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [r"^(?:ast-grep|sg)\b"]
+        .iter()
+        .map(|p| Regex::new(p).expect("搜索命令正则应可编译"))
+        .collect()
+});
+
+/// 判断归一化命令是否为 ast-grep 搜索命令（`sg` / `ast-grep`）。
+pub fn is_search_command(normalized: Option<&str>) -> bool {
+    matches_normalized_patterns(normalized, &SEARCH_COMMAND_PATTERNS)
+}
 
 /// 单条命中（字段借用输入）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

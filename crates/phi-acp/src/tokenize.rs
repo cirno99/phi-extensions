@@ -31,13 +31,10 @@ pub fn count_tokens(text: &str) -> u64 {
     if text.is_ascii() {
         return bytes.len().div_ceil(4) as u64;
     }
-    let mut cjk: u64 = 0;
-    for c in text.chars() {
-        if is_cjk(c) {
-            cjk += 1;
-        }
-    }
-    let chars = text.chars().count() as u64;
+    // 单次遍历同时统计字符总数与 CJK 数（此前 `chars()` 扫了两遍）。
+    let (chars, cjk) = text.chars().fold((0u64, 0u64), |(chars, cjk), c| {
+        (chars + 1, cjk + u64::from(is_cjk(c)))
+    });
     cjk + (chars - cjk).div_ceil(4)
 }
 

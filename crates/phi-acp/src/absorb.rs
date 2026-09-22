@@ -39,7 +39,6 @@ pub const NEVER_ABSORB_TOOLS: &[&str] = &[
     "acp_search",
     "acp_status",
     "acp_rule",
-    "acp_cache",
 ];
 
 /// 一次吸收的计划。
@@ -129,6 +128,17 @@ const MIN_KEEP_SUFFIX_CHARS: usize = 150;
 /// 使用率到达该值时保留窗口缩到下限（同时也是「超限压力带」的开端）。
 const AGGRESSIVE_AT_USAGE: f64 = 0.95;
 
+/// 压力插值系数：使用率从门槛升到 [`AGGRESSIVE_AT_USAGE`] 时由 0 线性升到 1。
+///
+/// 门槛缺失（0）时按满压起点处理。`resolve_keep_window` 与 `resolve_min_tokens`
+/// 共用同一套压力计算，避免两处各写一遍而漂移。
+fn pressure_ratio(usage: f64, config: &AbsorbConfig) -> f64 {
+    let floor_pct = config.context_threshold_pct.max(0.0);
+    // 从门槛到 AGGRESSIVE_AT_USAGE 之间线性加码；门槛缺失时按满压处理。
+    let span = (AGGRESSIVE_AT_USAGE - floor_pct).max(f64::EPSILON);
+    ((usage - floor_pct) / span).clamp(0.0, 1.0)
+}
+
 /// 根据当前使用率解析本次吸收的保留窗口。
 ///
 /// # 为什么是自适应的
@@ -146,10 +156,7 @@ const AGGRESSIVE_AT_USAGE: f64 = 0.95;
 /// 两端都是**硬插值**：t=0 时等于配置值，t=1 时落到 [`MIN_KEEP_PREFIX_CHARS`] /
 /// [`MIN_KEEP_SUFFIX_CHARS`]。配置值已经小于下限时以配置值为准（用户显式指定优先）。
 fn resolve_keep_window(usage: f64, config: &AbsorbConfig) -> (usize, usize) {
-    let floor_pct = config.context_threshold_pct.max(0.0);
-    // 从门槛到 AGGRESSIVE_AT_USAGE 之间线性加码；门槛缺失时按满压处理。
-    let span = (AGGRESSIVE_AT_USAGE - floor_pct).max(f64::EPSILON);
-    let t = ((usage - floor_pct) / span).clamp(0.0, 1.0);
+    let t = pressure_ratio(usage, config);
     let lerp = |configured: usize, floor: usize| -> usize {
         if configured <= floor {
             return configured;
@@ -172,9 +179,7 @@ fn resolve_min_tokens(usage: f64, config: &AbsorbConfig) -> u64 {
     /// 高压下的最小门槛：再小的输出也不值得为它付重跑成本。
     const MIN_TOKENS_FLOOR: u64 = 200;
     let configured = config.min_tool_tokens.max(MIN_TOKENS_FLOOR);
-    let floor_pct = config.context_threshold_pct.max(0.0);
-    let span = (AGGRESSIVE_AT_USAGE - floor_pct).max(f64::EPSILON);
-    let t = ((usage - floor_pct) / span).clamp(0.0, 1.0);
+    let t = pressure_ratio(usage, config);
     // 从配置值线性降到下限（最多降 60%）。
     let scaled = configured as f64 * (1.0 - 0.6 * t);
     (scaled as u64).clamp(MIN_TOKENS_FLOOR, configured)

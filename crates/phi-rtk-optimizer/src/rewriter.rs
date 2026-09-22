@@ -13,6 +13,7 @@
 // 与 pi 版的差异：pi 用 `pi.exec`（宿主提供的带超时子进程），这里直接用
 // `std::process::Command` + 轮询 `try_wait` 实现超时。
 
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -152,10 +153,27 @@ pub fn run_with_timeout(program: &str, args: &[&str], timeout_ms: u64) -> Result
         .spawn()
         .map_err(|err| err.to_string())?;
 
+    // 并发抽干 stdout/stderr：若等子进程退出后再读，写满管道缓冲（~64KB）的
+    // 子进程会阻塞在写、永不退出，于是被误判为超时。
+    let out_reader = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let err_reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -166,15 +184,14 @@ pub fn run_with_timeout(program: &str, args: &[&str], timeout_ms: u64) -> Result
             }
             Err(err) => return Err(err.to_string()),
         }
-    }
+    };
 
-    let output = child
-        .wait_with_output()
-        .map_err(|err| err.to_string())?;
+    let stdout = out_reader.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+    let stderr = err_reader.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
     Ok(ProcOutput {
-        code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
 }
 

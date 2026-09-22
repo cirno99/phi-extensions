@@ -11,7 +11,7 @@ use phi_ext_common::config as cfg;
 use phi_ext_common::paths;
 
 use crate::render::RenderStrategy;
-use crate::types::Config;
+use crate::types::{AbsorbConfig, Config};
 
 /// 扩展名（也是数据目录名）。
 pub const EXTENSION_NAME: &str = "phi-acp";
@@ -332,6 +332,23 @@ impl AcpConfig {
             absorb.exclude_tools = self.absorb_exclude_tools.clone();
         }
         config
+    }
+    /// 只构造 absorb 子配置（`record_tool_result` 的热路径）。
+    ///
+    /// 等价于 `self.to_kernel_config().absorb.unwrap_or_default()`，但省掉了
+    /// `Config::default_for` 分配的那几个空 `Vec` 与其余字段的拷贝——该函数
+    /// **每条工具结果**都会调用一次。
+    pub fn to_absorb_config(&self) -> AbsorbConfig {
+        AbsorbConfig {
+            enabled: self.absorb_enabled,
+            min_tool_tokens: self.absorb_min_tool_tokens,
+            keep_prefix_chars: self.absorb_keep_prefix_chars,
+            keep_suffix_chars: self.absorb_keep_suffix_chars,
+            context_threshold_pct: self.absorb_context_threshold_pct,
+            always_above_tokens: self.absorb_always_above_tokens,
+            exclude_tools: self.absorb_exclude_tools.clone(),
+            ..AbsorbConfig::default()
+        }
     }
 }
 

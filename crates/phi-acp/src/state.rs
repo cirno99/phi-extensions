@@ -67,12 +67,27 @@ pub fn block_by_id<'a>(
     state: &'a CompressionState,
     block_id: &str,
 ) -> Option<&'a CompressionBlock> {
+    // 快路径：块只增不删、id 由 `allocate_block_id` 单调分配，因此 `bN` 就在
+    // 下标 N-1（O(1)）。命中即返回；不满足该不变式的 id 回退到线性查找。
+    if let Some(rest) = block_id.strip_prefix('b') {
+        if let Ok(n) = rest.parse::<usize>() {
+            if n >= 1 {
+                if let Some(block) = state.blocks.get(n - 1) {
+                    if block.block_id == block_id {
+                        return Some(block);
+                    }
+                }
+            }
+        }
+    }
     state.blocks.iter().find(|block| block.block_id == block_id)
 }
 
 /// 全部活跃块。
-pub fn active_blocks(state: &CompressionState) -> Vec<&CompressionBlock> {
-    state.blocks.iter().filter(|block| block.active).collect()
+pub fn active_blocks(
+    state: &CompressionState,
+) -> impl Iterator<Item = &CompressionBlock> + '_ {
+    state.blocks.iter().filter(|block| block.active)
 }
 
 /// 活跃块覆盖的原始消息 id 集合。
@@ -143,7 +158,7 @@ mod tests {
             effective_message_ids: vec!["m2".into()],
             ..Default::default()
         });
-        assert_eq!(active_blocks(&state).len(), 1);
+        assert_eq!(active_blocks(&state).count(), 1);
         assert_eq!(covered_message_ids(&state).len(), 1);
         assert_eq!(highest_active_tier(&state), 1);
     }

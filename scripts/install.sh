@@ -27,6 +27,7 @@ EXTENSIONS=(
   phi-cache-optimizer
   phi-acp
   phi-deepseek-enhanced
+  phi-ast-grep
 )
 
 PHI_HOME="${PHI_HOME:-$HOME/.phi}"
