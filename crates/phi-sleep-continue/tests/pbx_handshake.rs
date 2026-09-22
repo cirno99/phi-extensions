@@ -20,7 +20,6 @@ const EXTENSION_NAME: &str = "phi-sleep-continue";
 const EXPECTED_COMMANDS: &[&str] = &[
     "sleep-on",
     "sleep-off",
-    "sleep-set",
     "sleep-max",
     "sleep-status",
     "sleep-approval",

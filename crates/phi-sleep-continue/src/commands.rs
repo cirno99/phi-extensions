@@ -1,6 +1,6 @@
 // commands.rs — 无人值守自动继续的斜杠命令。
 //
-// 对应 pi 版的 /sleep-on /sleep-off /sleep-set /sleep-max /sleep-status。
+// 对应 pi 版的 /sleep-on /sleep-off /sleep-max /sleep-status。
 // pi 的 /sleep-stall 依赖看门狗（phi 无 abort/定时器能力），已移除。
 // 另参照 pi-auto-approval 增加 /sleep-approval（自动审批开关、模式与名单）。
 //
@@ -16,7 +16,6 @@ use crate::state::Shared;
 pub fn register(ext: &mut phi::Extension, shared: Shared) {
     register_on(ext, shared.clone());
     register_off(ext, shared.clone());
-    register_set(ext, shared.clone());
     register_max(ext, shared.clone());
     register_mode(ext, shared.clone());
     register_status(ext, shared.clone());
@@ -80,41 +79,6 @@ fn register_off(ext: &mut phi::Extension, shared: Shared) {
             ctx.notify("info", "\u{1F319} 自动继续已关闭");
             Ok(())
         }),
-    );
-}
-
-/// `/sleep-set <文本>` — 设置继续文本并开启。
-fn register_set(ext: &mut phi::Extension, shared: Shared) {
-    ext.register_command(
-        "sleep-set",
-        phi::Command::new(
-            "设置继续文本并开启（用法：/sleep-set <文本>）",
-            move |args, ctx| {
-                let text = args.trim();
-                if text.is_empty() {
-                    ctx.notify(
-                        "warning",
-                        "用法：/sleep-set <继续文本>，例如 /sleep-set 继续按计划推进",
-                    );
-                    return Ok(());
-                }
-                let (footer, continue_text) = {
-                    let mut state = shared.borrow_mut();
-                    state.continue_text = text.to_string();
-                    state.enabled = true;
-                    state.suspended = false;
-                    state.reset_budget();
-                    (state.footer(), state.continue_text.clone())
-                };
-                ctx.set_status(&footer);
-                ctx.notify(
-                    "info",
-                    &format!("\u{1F319} 自动继续已开启，继续文本：“{continue_text}”"),
-                );
-                Ok(())
-            },
-        )
-        .needs_args(),
     );
 }
 
