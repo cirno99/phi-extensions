@@ -24,7 +24,7 @@ use crate::render::{render_with_snapshot, RenderStrategy};
 use crate::state::{
     active_blocks, advance_survival, allocate_block_id, allocate_run_id, block_by_id,
 };
-use crate::tokenize::count_message_tokens;
+use crate::tokenize::{count_message_tokens, MessageTokenIndex};
 use crate::truncate::{truncate_large_tool_outputs, TruncateOptions};
 use crate::types::{
     ApplyCompressionOutcome, ApplyResult, CompressRangeSpec, CompressionBlock, CompressionState,
@@ -505,9 +505,10 @@ pub fn apply_compression(
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
+    let tokens = MessageTokenIndex::build(messages);
     let protected = match protected_message_ids {
         Some(ids) => ids.clone(),
-        None => compute_protected_refs(messages, state, config),
+        None => compute_protected_refs(messages, state, config, &tokens),
     };
 
     let pre_existing_coverage = collect_coverage(state);
@@ -617,7 +618,8 @@ pub fn apply_compression(
         // ≥ MIN_RANGE_COVERAGE_PCT% 即视为「该压的都压了」。与
         // `merge_ranges_to_threshold` 的同类回归一致（整批低于阈值也必须放行）。
         let covers_most_compressible = total_chars >= config.compress.min_compress_range || {
-            let available: usize = build_compressible_ranges(messages, &work, config, &protected)
+            let available: usize =
+                build_compressible_ranges(messages, &work, config, &protected, &tokens)
                 .compressible
                 .iter()
                 .map(|r| r.chars.unwrap_or((r.tokens * 4) as usize))
@@ -882,18 +884,17 @@ fn tier_action_hint(config: &Config, state: &CompressionState) -> String {
 }
 
 /// 同步块：失活被消费 / 消失的块。
-pub fn sync_blocks(messages: &[CoreMessage], state: &CompressionState) -> CompressionState {
+pub fn sync_blocks(messages: &[CoreMessage], mut state: CompressionState) -> CompressionState {
     let present: BTreeSet<&str> = messages.iter().map(|m| m.id.as_str()).collect();
-    let mut result = clone_state(state);
 
     let mut consumed: BTreeSet<String> = BTreeSet::new();
-    for block in &result.blocks {
+    for block in &state.blocks {
         for id in &block.direct_block_ids {
             consumed.insert(id.clone());
         }
     }
 
-    for block in &mut result.blocks {
+    for block in &mut state.blocks {
         if consumed.contains(&block.block_id) {
             block.active = false;
             continue;
@@ -916,15 +917,15 @@ pub fn sync_blocks(messages: &[CoreMessage], state: &CompressionState) -> Compre
     // 按当前存在的 ref 裁剪 token 快照。
     let live_refs: BTreeSet<String> = messages
         .iter()
-        .filter_map(|m| result.message_refs.by_raw.get(&m.id).cloned())
+        .filter_map(|m| state.message_refs.by_raw.get(&m.id).cloned())
         .collect();
-    if result.token_snapshot.len() != live_refs.len() {
-        result
+    if state.token_snapshot.len() != live_refs.len() {
+        state
             .token_snapshot
             .retain(|reference, _| live_refs.contains(reference));
     }
 
-    result
+    state
 }
 
 /// 隐藏已被消费的 compress 调用（其摘要已入块）。
@@ -968,7 +969,7 @@ fn hide_consumed_compress_calls(
 
 fn assign_refs_node(
     messages: &[CoreMessage],
-    state: &CompressionState,
+    mut state: CompressionState,
     config: &Config,
 ) -> CompressionState {
     let has_protection =
@@ -985,7 +986,9 @@ fn assign_refs_node(
                 .map(|l| is_message_latest_protected(m, l))
                 .unwrap_or(false)
     };
-    let existing = state.message_refs.clone();
+    // 直接移出旧 ref 映射：`assign_refs` 只借用它并返回一份**全新的**映射，
+    // 因此无需再克隆一份（长会话下 `message_refs` 很大，克隆是纯浪费）。
+    let existing = std::mem::take(&mut state.message_refs);
     let result = assign_refs(
         messages,
         AssignRefsOptions {
@@ -994,15 +997,14 @@ fn assign_refs_node(
             is_protected: has_protection.then_some(&protected_fn as &dyn Fn(&CoreMessage) -> bool),
         },
     );
-    let mut next = clone_state(state);
-    next.message_refs = result.map;
-    next
+    state.message_refs = result.map;
+    state
 }
 
 /// 跑完整节点管线（对应 `processTurn`）。
 pub fn process_turn(
     messages: &[CoreMessage],
-    state: &CompressionState,
+    state: CompressionState,
     config: &Config,
     token_count: u64,
     render_tags: RenderStrategy,
@@ -1011,7 +1013,7 @@ pub fn process_turn(
     let mut work = assign_refs_node(messages, state, config);
 
     // 2. sync-blocks + advance-survival
-    work = sync_blocks(messages, &work);
+    work = sync_blocks(messages, work);
     advance_survival(&mut work, config.promotion_threshold);
 
     // 3. prune
@@ -1021,8 +1023,11 @@ pub fn process_turn(
     current = hide_consumed_compress_calls(current, &work);
 
     // 5. recommend
-    let protected_refs = compute_protected_refs(&current, &work, config);
-    let context_ranges = build_compressible_ranges(&current, &work, config, &protected_refs);
+    // 5. recommend（同一批消息只算一次 token）
+    let tokens = MessageTokenIndex::build(&current);
+    let protected_refs = compute_protected_refs(&current, &work, config, &tokens);
+    let context_ranges =
+        build_compressible_ranges(&current, &work, config, &protected_refs, &tokens);
     let recommendation = Recommendation {
         nothing_to_compress: context_ranges.compressible.is_empty(),
         recommended_ranges: merge_ranges_to_threshold(
@@ -1252,7 +1257,7 @@ mod tests {
         let messages = vec![user("u", "hello world")];
         let state = crate::state::create_initial_state();
         let config = Config::default_for(200_000);
-        let outcome = process_turn(&messages, &state, &config, 10, RenderStrategy::All);
+        let outcome = process_turn(&messages, state, &config, 10, RenderStrategy::All);
         assert!(outcome.state.message_refs.by_raw.contains_key("u"));
         assert!(outcome.messages[0].text_str().contains("m00001"));
     }
@@ -1275,7 +1280,7 @@ mod tests {
             ..Default::default()
         });
         let messages = vec![user("a", "x")];
-        let synced = sync_blocks(&messages, &state);
+        let synced = sync_blocks(&messages, state);
         assert!(!synced.blocks[0].active);
         assert!(synced.blocks[1].active);
     }

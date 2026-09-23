@@ -42,12 +42,24 @@ thread_local! {
     static CACHE: RefCell<Option<SessionCache>> = const { RefCell::new(None) };
 }
 
+// 解析出的会话**目录**缓存：命中后不再读 `/proc`、不再重算项目目录名，
+// 只在该目录内重扫最新 `.jsonl`。
+//
+// 为什么缓存目录而不是文件：`/new` 之后新会话文件是**惰性创建**的，新文件
+// 出现前旧文件仍是最新；若把文件本身缓存下来，新文件出现后会一直读旧文件、
+// 无法自愈（`refresh_session_key` 正是靠反复重扫来痊愈的）。目录在整个进程
+// 生命周期内稳定（cwd 不变），缓存它安全。会话切换由 [`reset_cache`] 清空。
+thread_local! {
+    static ACTIVE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
 /// 清空复用的读取缓存。
 ///
 /// 会话切换（`SessionShutdown` / `SessionStart`）时必须调用：旧会话记住的文件
 /// 偏移拿去读新会话的文件会直接跳过头几行（甚至把别人的 usage 当成本会话的）。
 pub fn reset_cache() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
+    ACTIVE_DIR.with(|slot| *slot.borrow_mut() = None);
 }
 
 // 最近一次读取是否真的拿到了宿主 usage。
@@ -135,6 +147,11 @@ fn finish(tokens: Option<u64>) -> Option<u64> {
 /// **不做**「全局最新 `.jsonl`」回退：多项目并行时会读到别的项目的会话，
 /// 把别人的 usage 当成本会话的上下文，使用率判断随之错位。宁可不给数。
 pub(crate) fn active_session_file() -> Option<PathBuf> {
+    // 会话目录已知时只重扫该目录取最新文件（见 `ACTIVE_DIR` 的说明）。
+    if let Some(dir) = ACTIVE_DIR.with(|slot| slot.borrow().clone()) {
+        return newest_jsonl_in(&dir);
+    }
+
     let mut candidates: Vec<String> = vec![host_cwd()];
     if let Some(cwd) = parent_process_cwd() {
         candidates.push(cwd);
@@ -147,6 +164,7 @@ pub(crate) fn active_session_file() -> Option<PathBuf> {
         }
         let dir = session_base().join(paths::project_dir_name(&cwd));
         if let Some(file) = newest_jsonl_in(&dir) {
+            ACTIVE_DIR.with(|slot| *slot.borrow_mut() = Some(dir));
             return Some(file);
         }
     }

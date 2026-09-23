@@ -9,7 +9,7 @@ use crate::protected::{
     is_message_protected_with_pairing, is_never_preserve_recent,
 };
 use crate::prune::SUMMARY_HEADER;
-use crate::tokenize::count_message_tokens;
+use crate::tokenize::MessageTokenIndex;
 use crate::types::{
     CompressibleRange, CompressionState, Config, ContentType, ContextRanges, CoreMessage,
     ProtectedRange, Role,
@@ -39,6 +39,7 @@ pub fn compute_protected_refs(
     messages: &[CoreMessage],
     state: &CompressionState,
     config: &Config,
+    tokens: &MessageTokenIndex<'_>,
 ) -> BTreeSet<String> {
     let preserve_n = config.preserve_recent_messages;
     let preserve_tokens = config.preserve_recent_tokens;
@@ -56,7 +57,7 @@ pub fn compute_protected_refs(
         if reference == crate::refs::BLOCKED_REF {
             continue;
         }
-        visible.push((reference.clone(), count_message_tokens(message)));
+        visible.push((reference.clone(), tokens.tokens(message)));
     }
 
     if preserve_n > 0 {
@@ -316,6 +317,7 @@ pub fn build_compressible_ranges(
     state: &CompressionState,
     config: &Config,
     protected_zone_refs: &BTreeSet<String>,
+    tokens: &MessageTokenIndex<'_>,
 ) -> ContextRanges {
     struct CompressibleInfo {
         id: String,
@@ -356,7 +358,7 @@ pub fn build_compressible_ranges(
             protected_msgs.push((
                 reference.clone(),
                 skip_since_protected,
-                count_message_tokens(message),
+                tokens.tokens(message),
                 message.tool_name.iter().cloned().collect(),
                 index,
             ));
@@ -375,7 +377,7 @@ pub fn build_compressible_ranges(
             id: message.id.clone(),
             reference: reference.clone(),
             gap_before: skip_since_compressible,
-            tokens: count_message_tokens(message),
+            tokens: tokens.tokens(message),
             chars: message.text_str().chars().count(),
             is_tool: is_tool_message(message),
             is_user: message.role == Role::User,
@@ -648,7 +650,8 @@ mod tests {
         ];
         let state = with_refs(&messages);
         let config = Config::default_for(1000);
-        let refs = compute_protected_refs(&messages, &state, &config);
+        let tokens = crate::tokenize::MessageTokenIndex::build(&messages);
+        let refs = compute_protected_refs(&messages, &state, &config, &tokens);
         // 默认 preserveRecentMessages=5，全部保护。
         assert!(refs.contains("m00003"));
     }
@@ -664,7 +667,9 @@ mod tests {
         let mut config = Config::default_for(1000);
         config.preserve_recent_messages = 0;
         config.preserve_recent_tokens = 0;
-        let ranges = build_compressible_ranges(&messages, &state, &config, &BTreeSet::new());
+        let tokens = crate::tokenize::MessageTokenIndex::build(&messages);
+        let ranges =
+            build_compressible_ranges(&messages, &state, &config, &BTreeSet::new(), &tokens);
         assert_eq!(ranges.compressible.len(), 1);
         assert_eq!(ranges.compressible[0].count, 3);
     }

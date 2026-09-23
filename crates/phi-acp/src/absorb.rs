@@ -186,7 +186,8 @@ fn resolve_min_tokens(usage: f64, config: &AbsorbConfig) -> u64 {
 }
 
 /// 规划一次吸收；`None` 表示这条结果保持原样。
-/// `handle` 是调用方预分配的句柄（`aN`）：`reversible` 为真时 stub 里会带上它，
+/// `next_absorb_id` 是调用方传入的下一个句柄编号：**只有确认命中时**才格式化成
+/// `aN` 写进 stub（未命中路径不分配），`reversible` 为真时 stub 里会带上它，
 /// 模型据此用 `acp_decompress <handle>` 取回原文（调用方负责把原文写进
 /// [`crate::absorb_store`]）；为假时退化为「已丢弃、需重跑」的旧措辞，
 /// 不向模型承诺一个取不回来的句柄。
@@ -199,7 +200,7 @@ pub fn plan_absorb(
     is_error: bool,
     context_usage: f64,
     config: &AbsorbConfig,
-    handle: &str,
+    next_absorb_id: u64,
     reversible: bool,
 ) -> Option<AbsorbPlan> {
     if !config.enabled || is_error {
@@ -240,6 +241,9 @@ pub fn plan_absorb(
         total_chars,
     );
     let elided_chars = total_chars - keep_prefix - keep_suffix;
+    // 句柄只在**确认命中**后才构造：未命中路径（小输出 / 排除工具 / 未过门槛）
+    // 不再每条工具结果都分配一个短字符串（旧 `peek_absorb_id` 的浪费）。
+    let handle = format!("a{}", next_absorb_id.max(1));
     let marker = format!(
         "...{ABSORB_MARKER} {elided_chars} chars (~{} tokens) elided from {tool_name} output; {}",
         original_tokens.saturating_sub(count_tokens(&prefix) + count_tokens(&suffix)),
@@ -260,7 +264,7 @@ pub fn plan_absorb(
     }
     Some(AbsorbPlan {
         text,
-        handle: handle.to_string(),
+        handle,
         original_tokens,
         stub_tokens,
     })
@@ -282,13 +286,13 @@ mod tests {
 
     #[test]
     fn small_output_should_be_untouched() {
-        assert!(plan_absorb("bash", "hello", false, 0.0, &config(), "a1", true).is_none());
+        assert!(plan_absorb("bash", "hello", false, 0.0, &config(), 1, true).is_none());
     }
 
     #[test]
     fn large_output_should_be_absorbed_with_head_and_tail() {
         let big = format!("HEAD{}TAIL", "x".repeat(60_000));
-        let plan = plan_absorb("bash", &big, false, 0.0, &config(), "a1", true).expect("应吸收");
+        let plan = plan_absorb("bash", &big, false, 0.0, &config(), 1, true).expect("应吸收");
         assert!(plan.text.starts_with("HEAD"));
         assert!(plan.text.ends_with("TAIL"));
         assert!(plan.text.contains(ABSORB_MARKER));
@@ -314,10 +318,10 @@ mod tests {
     #[test]
     fn errors_and_acp_tools_should_be_untouched() {
         let big = "x".repeat(60_000);
-        assert!(plan_absorb("bash", &big, true, 0.0, &config(), "a1", true).is_none());
+        assert!(plan_absorb("bash", &big, true, 0.0, &config(), 1, true).is_none());
         for tool in NEVER_ABSORB_TOOLS {
             assert!(
-                plan_absorb(tool, &big, false, 0.0, &config(), "a1", true).is_none(),
+                plan_absorb(tool, &big, false, 0.0, &config(), 1, true).is_none(),
                 "{tool}"
             );
         }
@@ -326,8 +330,8 @@ mod tests {
     #[test]
     fn already_absorbed_should_be_idempotent() {
         let big = format!("HEAD{}TAIL", "x".repeat(60_000));
-        let plan = plan_absorb("bash", &big, false, 0.0, &config(), "a1", true).expect("应吸收");
-        assert!(plan_absorb("bash", &plan.text, false, 0.0, &config(), "a1", true).is_none());
+        let plan = plan_absorb("bash", &big, false, 0.0, &config(), 1, true).expect("应吸收");
+        assert!(plan_absorb("bash", &plan.text, false, 0.0, &config(), 1, true).is_none());
     }
 
     #[test]
@@ -339,8 +343,8 @@ mod tests {
             always_above_tokens: 0,
             ..config()
         };
-        assert!(plan_absorb("bash", &big, false, 0.2, &gated, "a1", true).is_none());
-        assert!(plan_absorb("bash", &big, false, 0.7, &gated, "a1", true).is_some());
+        assert!(plan_absorb("bash", &big, false, 0.2, &gated, 1, true).is_none());
+        assert!(plan_absorb("bash", &big, false, 0.7, &gated, 1, true).is_some());
     }
 
     /// 门槛之下，「巨型」输出仍应被吸收：否则早期会话 / 高门槛会话里，
@@ -354,12 +358,12 @@ mod tests {
         };
         // ~15000 token，远超 always_above_tokens：低水位也吸收。
         let huge = "x".repeat(60_000);
-        assert!(plan_absorb("bash", &huge, false, 0.1, &gated, "a1", true).is_some());
+        assert!(plan_absorb("bash", &huge, false, 0.1, &gated, 1, true).is_some());
         // ~1000 token，低于 always_above_tokens：低水位不吸收。
         let medium = "x".repeat(4_000);
-        assert!(plan_absorb("bash", &medium, false, 0.1, &gated, "a1", true).is_none());
+        assert!(plan_absorb("bash", &medium, false, 0.1, &gated, 1, true).is_none());
         // 越过门槛后，同一「中等」输出由常规门槛接管（min_tool_tokens 已降）。
-        assert!(plan_absorb("bash", &medium, false, 0.9, &gated, "a1", true).is_some());
+        assert!(plan_absorb("bash", &medium, false, 0.9, &gated, 1, true).is_some());
     }
 
     #[test]
@@ -385,7 +389,7 @@ mod tests {
             ..config()
         };
         let mid = "x".repeat(9000);
-        assert!(plan_absorb("bash", &mid, false, 0.0, &cfg, "a1", true).is_none());
+        assert!(plan_absorb("bash", &mid, false, 0.0, &cfg, 1, true).is_none());
     }
 
     /// 保留窗口随使用率单调收缩：这是「吸到高水位就多删」的调节回路。
@@ -423,9 +427,9 @@ mod tests {
         };
         // ~800 token（3200 字符）的中等输出：门槛 1000 时不够格。
         let mid = format!("HEAD{}TAIL", "x".repeat(3200));
-        assert!(plan_absorb("bash", &mid, false, 0.30, &cfg, "a1", true).is_none());
+        assert!(plan_absorb("bash", &mid, false, 0.30, &cfg, 1, true).is_none());
         // 接近上限时门槛降到 400（降 60%），同一条输出被吸收。
-        assert!(plan_absorb("bash", &mid, false, 0.95, &cfg, "a1", true).is_some());
+        assert!(plan_absorb("bash", &mid, false, 0.95, &cfg, 1, true).is_some());
     }
 
     /// 回收量必须随压力单调递增（更高使用率 → 保留窗口更小 → 删得更多）。
@@ -438,8 +442,8 @@ mod tests {
             ..config()
         };
         let big = format!("HEAD{}TAIL", "y".repeat(80_000));
-        let low = plan_absorb("bash", &big, false, 0.35, &cfg, "a1", true).expect("应吸收");
-        let high = plan_absorb("bash", &big, false, 0.95, &cfg, "a1", true).expect("应吸收");
+        let low = plan_absorb("bash", &big, false, 0.35, &cfg, 1, true).expect("应吸收");
+        let high = plan_absorb("bash", &big, false, 0.95, &cfg, 1, true).expect("应吸收");
         assert!(
             high.reclaimed_tokens() > low.reclaimed_tokens(),
             "高压下应回收更多：low={} high={}",

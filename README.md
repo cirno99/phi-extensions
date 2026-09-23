@@ -12,7 +12,6 @@
 | [`phi-cache-optimizer`](crates/phi-cache-optimizer) | `pi-cache-optimizer.js` | 缓存优化配置 + 能力诊断（可落地子集，见下） |
 | [`phi-acp`](crates/phi-acp) | `billion-context` + `acp-kernel` | ACP 上下文压缩：模型驱动、三级 LSM、可解压/可检索（合并移植，见下） |
 | [`phi-deepseek-enhanced`](crates/phi-deepseek-enhanced) | `deepseek-enhanced.ts` | We-need 推理风格锚点 + `str_replace_editor` 工具 + Eternal Minimal 运行时守卫（可落地子集，见下） |
-| [`phi-ast-grep`](crates/phi-ast-grep) | `pi-ast-grep` | AST 感知的代码搜索与改写（`ast_grep_search` / `ast_grep_replace`），宿主需自备 ast-grep 二进制 |
 | [`phi-ext-common`](crates/phi-ext-common) | — | 共享工具库：路径、配置原子读写、ANSI、文本截断、用量统计、竞技场分配器、jemalloc |
 
 > `pi-statusline` **未移植**：phi 宿主已自带状态栏。其中两项纯计算已补进
@@ -236,23 +235,6 @@ Today/cwd 系统提醒；`tool_call` 在 `minimal` 模式下阻止非核心工�
   宿主内建能力。
 - **无请求体钩子 / 拿不到消息历史 / 拿不到 assistant 推理文本**：provider 载荷过滤、
   thinking 与 256k token 上限、消息过滤、CoT 回归再注入均无法实现。
-### ast-grep
-
-把 [pi-ast-grep](https://github.com/code-yeongyu/pi-ast-grep) 移植为 phi 扩展：AST 感知的代码搜索与改写。
-
-| 入口 | 说明 |
-|---|---|
-| `ast_grep_search` 工具 | AST 结构搜索（25 种语言，`$VAR` / `$$$` 元变量），无副作用、可并行 |
-| `ast_grep_replace` 工具 | AST 结构改写，**默认 dry-run**（`dryRun: false` 才落盘），顺序执行 |
-| `/ast-grep` | 显示解析到的二进制路径与版本 |
-
-**与 pi 版的唯一有意差异**：不做自动下载，要求宿主 PATH 上已有 ast-grep 二进制
-（`sg` 或 `ast-grep`）。找不到时工具返回安装提示：
-`npm install -g @ast-grep/cli` / `cargo install ast-grep --locked` / `brew install ast-grep`。
-
-`ast_grep_search` 的 pattern 必须是**完整 AST 节点**（不是正则）；零匹配时会给出
-反模式提示（如 `\d`、`[a-z]`、`foo|bar`）并建议改用内置 `grep` 做纯文本搜索。
-
 ## pi → phi 的关键差异
 
 phi 的 Rust SDK 与 pi 的扩展 API 并不等价。完整映射表见 [PLAN.md](PLAN.md)，
@@ -276,9 +258,6 @@ phi 的 Rust SDK 与 pi 的扩展 API 并不等价。完整映射表见 [PLAN.md
 - **转向只能靠 `turn_stopping`**：pi 的 `sendMessage(steer)` 在 phi 对应
   `on_turn_stopping` 返回 `Continue + message`，只在「本轮无工具调用、
   即将结束」时触发一次；据此加了连续转向上限防止死循环。
-- **工具处理器拿不到 `Context`**：`cwd` / `session_id` 只在命令处理器可用；
-  ast-grep 改读父进程 `/proc/<ppid>/cwd` 定位项目目录，并把子进程工作目录
-  设为该目录，保证模型传入的相对路径按项目解析。
 
 ## 性能
 
@@ -354,10 +333,37 @@ rtk 原先自带的 ANSI 正则实现漏剥带私有参数的 CSI 序列：
   acp 的 `tools.rs` schema 构造、sleep-continue 的 `write_stable`、deepseek 的
   `str_replace_editor` 入参解析等也都改走 `phi_ext_common::json`。
 
+### 第三轮优化（行为不变）
+
+- **acp 去掉每 turn 两次状态深拷贝**：`process_turn` 改为**按值接收** `CompressionState`
+  （`runtime.rs` 先 `std::mem::take` 移出、返回后再移回），`assign_refs_node` /
+  `sync_blocks` 就地修改、不再各自 `clone_state`。`assign_refs_node` 还直接
+  `std::mem::take` 旧 `message_refs`（`assign_refs` 只借用它、返回全新映射）。
+- **acp 同一批消息只计一次 token**：新增 `tokenize::MessageTokenIndex`，把
+  `compute_protected_refs` 与 `build_compressible_ranges` 对同一批消息的两次全量
+  token 扫描收敛成一次（每 turn 触发）。
+- **acp 会话目录解析缓存**：`session_tokens` 缓存解析出的会话**目录**，命中后不再
+  读 `/proc/<ppid>/cwd`、不再重算项目目录名，只在该目录内重扫最新 `.jsonl`。缓存目录
+  而非文件，是为了不破坏 `/new` 后新会话文件**惰性创建**时的自愈（见
+  `refresh_session_key`）。
+- **acp absorb 热路径不再每条工具结果分配句柄**：`plan_absorb` 改收
+  `next_absorb_id: u64`，只有确认命中时才 `format!("a{}")`；移除随之无用的
+  `state::peek_absorb_id`。
+- **修一个测试隔离缺陷**：`absorb_store::disabled_store_should_not_write` 未指向临时
+  目录，会读用户真实的 `state/absorbed`，一旦那里恰好有 `a1` 就误判失败。
+
+未采纳（收益与风险不成比例）：
+
+- `plan_absorb` 里对 `prefix` / `suffix` / `text` 的多次 `count_tokens` 都是**小窗口**
+  （各约 2KB），相对 `count_tokens(content)` 的全量扫描可忽略。
+- rtk `run_with_timeout` 每个子进程 spawn 两个读取线程：这是纯 std 下避免管道写满死锁的
+  标准写法；改成单线程非阻塞读需要引入 `libc` / `mio`，而线程创建（~40µs）相对子进程
+  本身（ms 级）只占约 2~4%。
+
 ## 开发
 
 ```bash
-cargo test --workspace     # 380 个测试（含 5 个 PXB 生命周期端到端冒烟测试）
+cargo test --workspace     # 569 个测试（含 5 个 PXB 生命周期端到端冒烟测试）
 cargo build --release      # 构建全部扩展
 cargo clippy --workspace --all-targets   # 静态检查（当前零告警）
 ```

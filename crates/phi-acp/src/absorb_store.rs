@@ -173,9 +173,13 @@ mod tests {
 
     #[test]
     fn disabled_store_should_not_write() {
-        set_enabled(false);
-        assert!(store("a1", "x").is_none());
-        assert!(load("a1").is_none());
+        // 必须指向临时目录：否则 `load` 会去读用户真实的 `state/absorbed`，
+        // 一旦那里恰好有 `a1` 就误判失败（与本次改动无关的历史隔离缺陷）。
+        with_temp_dir(|| {
+            set_enabled(false);
+            assert!(store("a1", "x").is_none());
+            assert!(load("a1").is_none());
+        });
     }
 
     /// 句柄编号是**每会话**的，因此原文也必须按会话分目录：否则两个会话的 `a1`

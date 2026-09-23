@@ -1,5 +1,0 @@
-name: phi-ast-grep
-version: "0.1.0"
-exec: ./phi-ast-grep
-description: AST 感知的代码搜索与改写（ast_grep_search / ast_grep_replace，宿主需自备 ast-grep 二进制）
-enabled: true

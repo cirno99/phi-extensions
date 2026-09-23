@@ -7,6 +7,8 @@
 //! 走 `str::is_ascii` 的向量化快路径（一次扫描 + 一次除法），只有出现高位字节时
 //! 才逐字符判定 CJK 区间。
 
+use std::collections::HashMap;
+
 use crate::types::CoreMessage;
 
 /// 判断一个 Unicode 标量是否落在「CJK 密集」区间（中日韩文字 + 假名 + 谚文）。
@@ -60,6 +62,37 @@ pub fn count_message_tokens(message: &CoreMessage) -> u64 {
 /// 以给定分词器计量单条消息。
 pub fn count_message_tokens_with(message: &CoreMessage, count: &dyn Fn(&str) -> u64) -> u64 {
     count(message.text_str()) + thinking_token_value(message.thinking_tokens)
+}
+
+/// 一批消息的 token 索引：同一 turn 内 `compute_protected_refs` /
+/// `build_compressible_ranges` / 细分统计都要遍历同一批消息并逐条计数。
+/// 把它们各自的全量扫描收敛成**一次**，避免每 turn 对同样的文本重复计数。
+///
+/// 键是消息 id（视图内唯一）；缺失时回退实时计算（防御，正常不会发生）。
+pub struct MessageTokenIndex<'a> {
+    by_id: HashMap<&'a str, u64>,
+}
+
+impl<'a> MessageTokenIndex<'a> {
+    /// 遍历一次 `messages`，算好每条消息的 token 数。
+    pub fn build(messages: &'a [CoreMessage]) -> Self {
+        let mut by_id = HashMap::with_capacity(messages.len());
+        for message in messages {
+            by_id
+                .entry(message.id.as_str())
+                .or_insert_with(|| count_message_tokens(message));
+        }
+        Self { by_id }
+    }
+
+    /// 取某条消息的 token 数。
+    #[inline]
+    pub fn tokens(&self, message: &CoreMessage) -> u64 {
+        self.by_id
+            .get(message.id.as_str())
+            .copied()
+            .unwrap_or_else(|| count_message_tokens(message))
+    }
 }
 
 #[cfg(test)]

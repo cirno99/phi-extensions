@@ -237,13 +237,18 @@ impl Runtime {
             raw_usage
         };
         let config = self.config.to_absorb_config();
-        // 预览句柄：stub 里带上它，模型可用 `acp_decompress <handle>` 取回原文。
-        // 只有真正命中吸收时才提交计数器（未命中既不落盘、也不在内存里留下空洞）。
-        let handle = crate::state::peek_absorb_id(&self.state);
-        // 只有在原文仓库可用时才向模型承诺「可取回」；否则回退到旧措辞。
+        // 只在真正命中吸收时才向模型承诺「可取回」；否则回退到旧措辞。
+        // 句柄编号直接传计数器值，由 `plan_absorb` 在命中后才格式化成字符串
+        // （未命中路径不再每条工具结果都分配一个句柄）。
         let reversible = crate::absorb_store::is_enabled();
         let plan = absorb::plan_absorb(
-            tool_name, &cleaned, is_error, usage, &config, &handle, reversible,
+            tool_name,
+            &cleaned,
+            is_error,
+            usage,
+            &config,
+            self.state.next_absorb_id,
+            reversible,
         );
 
         let (text, replacement) = match plan {
@@ -351,10 +356,12 @@ impl Runtime {
         let config = self.kernel_config();
         let token_count = self.effective_token_count();
         let strategy = self.render_strategy();
+        // 把状态**移入**内核管线（而不是传引用让它内部深拷贝）：内核按值接收、
+        // 就地修改，省掉每 turn 两次全量状态拷贝（blocks / message_refs 随会话
+        // 增长，每轮复制代价可观）；返回后再把新状态移回运行时。
+        let state = std::mem::take(&mut self.state);
         let mut outcome =
-            compress::process_turn(&self.messages, &self.state, &config, token_count, strategy);
-        // 内核已产出 owned 的新状态，直接移入运行时，省掉一次全量深拷贝
-        // （blocks / message_refs 随会话增长，每 turn 复制代价可观）。
+            compress::process_turn(&self.messages, state, &config, token_count, strategy);
         self.state = std::mem::take(&mut outcome.state);
         outcome
     }
